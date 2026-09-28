@@ -13,11 +13,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject, QSettings
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtPositioning import QGeoPositionInfo, QGeoPositionInfoSource
 from PySide6.QtWidgets import (
-    QApplication, QLineEdit, QMainWindow, QMessageBox, QVBoxLayout, QWidget
+    QApplication, QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget
 )
 
 GREEN = QColor(72, 255, 115)
@@ -32,7 +33,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.4.2 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.3 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -865,6 +866,25 @@ class NavDisplay(QWidget):
         self.instrument_timer.start(250)
 
         QTimer.singleShot(500, self.acquire_location)
+
+    def set_network_gps(self, enabled, host="", port=8080, protocol="tcp"):
+        if enabled:
+            host = str(host).strip()
+            protocol = str(protocol or "tcp").strip().lower()
+            if not host:
+                raise ValueError("Network GPS host is required")
+            if protocol not in ("tcp", "udp"):
+                raise ValueError("Network GPS protocol must be TCP or UDP")
+            port = int(port)
+            if not 1 <= port <= 65535:
+                raise ValueError("Network GPS port must be 1-65535")
+            self._network_gps = f"{protocol}://{host}:{port}"
+        else:
+            self._network_gps = None
+
+        # Re-evaluate immediately so a newly entered endpoint can take over
+        # without requiring an application restart.
+        self.acquire_location()
 
     def acquire_location(self):
         threading.Thread(target=self._location_worker, daemon=True).start()
@@ -1857,8 +1877,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("NAV-COM 2006 — Navigator")
         self.resize(1280,760)
+        self.settings = QSettings("NAV-COM", "NAV-COM 2006")
+
         shell=QWidget(); layout=QVBoxLayout(shell)
         layout.setContentsMargins(12,10,12,10); layout.setSpacing(6)
+
         self.search=QLineEdit()
         self.search.setPlaceholderText("DESTINATION > type address/place and press ENTER")
         self.search.setStyleSheet("""
@@ -1866,14 +1889,145 @@ class MainWindow(QMainWindow):
                         padding:8px; font: bold 15px 'DejaVu Sans Mono'; }
             QLineEdit:focus { border:2px solid #a5ffb5; }
         """)
+
+        gps_row = QWidget()
+        gps_layout = QHBoxLayout(gps_row)
+        gps_layout.setContentsMargins(0,0,0,0)
+        gps_layout.setSpacing(6)
+
+        self.net_gps_enabled = QCheckBox("NET GPS")
+        self.net_gps_enabled.setChecked(
+            self.settings.value("network_gps/enabled", False, type=bool)
+        )
+
+        self.net_gps_protocol = QComboBox()
+        self.net_gps_protocol.addItems(["TCP", "UDP"])
+        protocol = str(
+            self.settings.value("network_gps/protocol", "TCP")
+        ).upper()
+        self.net_gps_protocol.setCurrentText(
+            protocol if protocol in ("TCP", "UDP") else "TCP"
+        )
+
+        self.net_gps_host = QLineEdit()
+        env_endpoint = os.environ.get("NAVCOM_GPS_NETWORK", "").strip()
+        env_host = ""
+        env_port = 8080
+        env_protocol = "TCP"
+        if env_endpoint:
+            try:
+                parsed = parse_network_gps_endpoint(env_endpoint)
+                if parsed:
+                    env_protocol, env_host, env_port = (
+                        parsed[0].upper(), parsed[1], parsed[2]
+                    )
+            except Exception:
+                pass
+
+        saved_host = self.settings.value(
+            "network_gps/host", env_host or "192.168.1.87"
+        )
+        saved_port = self.settings.value(
+            "network_gps/port", env_port, type=int
+        )
+        if not self.settings.contains("network_gps/protocol") and env_endpoint:
+            self.net_gps_protocol.setCurrentText(env_protocol)
+
+        self.net_gps_host.setText(str(saved_host))
+        self.net_gps_host.setPlaceholderText("GPS HOST / IP")
+        self.net_gps_host.setMaximumWidth(185)
+
+        self.net_gps_port = QSpinBox()
+        self.net_gps_port.setRange(1, 65535)
+        self.net_gps_port.setValue(int(saved_port or 8080))
+        self.net_gps_port.setMaximumWidth(90)
+
+        self.net_gps_apply = QPushButton("APPLY")
+        self.net_gps_status = QLabel("")
+
+        gps_layout.addWidget(self.net_gps_enabled)
+        gps_layout.addWidget(self.net_gps_protocol)
+        gps_layout.addWidget(self.net_gps_host)
+        gps_layout.addWidget(self.net_gps_port)
+        gps_layout.addWidget(self.net_gps_apply)
+        gps_layout.addWidget(self.net_gps_status, 1)
+
+        gps_row.setStyleSheet("""
+            QCheckBox, QLabel {
+                color:#48ff73;
+                font: bold 11px 'DejaVu Sans Mono';
+            }
+            QLineEdit, QSpinBox, QComboBox {
+                background:#010703;
+                color:#48ff73;
+                border:1px solid #1b7d35;
+                padding:4px;
+                font: bold 11px 'DejaVu Sans Mono';
+            }
+            QPushButton {
+                background:#010703;
+                color:#48ff73;
+                border:1px solid #48ff73;
+                padding:4px 10px;
+                font: bold 11px 'DejaVu Sans Mono';
+            }
+            QPushButton:hover {
+                border:1px solid #a5ffb5;
+                color:#a5ffb5;
+            }
+        """)
+
         self.display=NavDisplay()
         self.search.returnPressed.connect(
             lambda: self.display.search_destination(self.search.text())
         )
+        self.net_gps_apply.clicked.connect(self.apply_network_gps_settings)
+        self.net_gps_enabled.toggled.connect(self.update_network_gps_controls)
+
         layout.addWidget(self.search)
+        layout.addWidget(gps_row)
         layout.addWidget(self.display,1)
         self.setCentralWidget(shell)
         shell.setStyleSheet("background:#010703;")
+
+        self.update_network_gps_controls()
+        QTimer.singleShot(0, self.apply_network_gps_settings)
+
+    def update_network_gps_controls(self):
+        enabled = self.net_gps_enabled.isChecked()
+        self.net_gps_protocol.setEnabled(enabled)
+        self.net_gps_host.setEnabled(enabled)
+        self.net_gps_port.setEnabled(enabled)
+        self.net_gps_status.setText(
+            "NETWORK NMEA ENABLED" if enabled else "NETWORK NMEA DISABLED"
+        )
+
+    def apply_network_gps_settings(self):
+        enabled = self.net_gps_enabled.isChecked()
+        host = self.net_gps_host.text().strip()
+        port = self.net_gps_port.value()
+        protocol = self.net_gps_protocol.currentText().lower()
+
+        try:
+            self.display.set_network_gps(
+                enabled, host, port, protocol
+            )
+        except Exception as exc:
+            self.net_gps_status.setText("ERROR: " + str(exc).upper())
+            return
+
+        self.settings.setValue("network_gps/enabled", enabled)
+        self.settings.setValue("network_gps/protocol", protocol.upper())
+        self.settings.setValue("network_gps/host", host)
+        self.settings.setValue("network_gps/port", port)
+        self.settings.sync()
+
+        if enabled:
+            self.net_gps_status.setText(
+                f"{protocol.upper()} {host}:{port}"
+            )
+        else:
+            self.net_gps_status.setText("NETWORK NMEA DISABLED")
 
 
 def main():
