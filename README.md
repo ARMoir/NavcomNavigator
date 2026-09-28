@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.4.0
+# NAV-COM 2006 — Navigator POC v0.4.1
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -7,7 +7,9 @@ are drawn directly by the application.
 
 ## Features
 
-- Windows laptop geolocation
+- USB/serial NMEA GPS as the preferred position source
+- cross-platform system-location fallback through Qt Positioning
+- direct Windows Location Services fallback when needed
 - real nearby OpenStreetMap road geometry
 - online-preferred map loading with fast offline preview/fallback
 - destination entry and explicit search on Enter
@@ -100,15 +102,57 @@ the offline data remains as the fallback.
 Destination search and driving routes still use the public Nominatim and OSRM
 services in this version.
 
-## GPS reality
+## GPS and location priority
 
-A Windows laptop without dedicated GNSS hardware may report location using
-Wi-Fi or other network-derived positioning. That is useful for proving the
-software but is not the ideal source for navigation in a moving vehicle.
+NAV-COM now prefers a real serial/USB GNSS receiver that outputs standard NMEA
+sentences. It automatically scans serial ports, prioritizes devices that look
+like GPS/GNSS receivers, and remembers the working port for the rest of the
+session.
 
-For an in-vehicle build, a USB GNSS receiver outputting NMEA is the preferred
-input. The renderer/navigation state is intentionally separated so an NMEA
-adapter can replace Windows Location Services without redesigning the UI.
+The location priority is:
+
+```text
+USB / serial NMEA GPS
+        ↓ no valid fix
+platform system location
+        ↓ unavailable
+Windows direct Location Services fallback
+        ↓ unavailable
+last known position / configured fallback
+```
+
+The platform system-location layer uses Qt Positioning. Depending on the
+operating system and available services, that can use native/network-derived
+location such as Wi-Fi positioning:
+
+- Windows: system location backend, with the existing direct WinRT path retained
+  as an additional fallback
+- macOS: the native Core Location backend when permission is available
+- Linux: the installed Qt/GeoClue positioning backend when available
+
+The header identifies the active source as `GPS LOCK`, `WIN LOC`,
+`MAC LOC`, `LINUX LOC`, or `LOC FALLBACK`.
+
+Most NMEA receivers use 9600 or 4800 baud, both of which NAV-COM tries
+automatically. You can force a serial device or baud rate with:
+
+```text
+NAVCOM_GPS_PORT
+NAVCOM_GPS_BAUD
+```
+
+For example on Windows:
+
+```powershell
+$env:NAVCOM_GPS_PORT = "COM4"
+$env:NAVCOM_GPS_BAUD = "9600"
+python main.py
+```
+
+On macOS, native location access in a packaged application requires the normal
+location usage description/permission in the application bundle. Linux system
+location depends on the desktop/distribution providing an available positioning
+service such as GeoClue.
 
 ## Current map behavior
 
@@ -235,6 +279,19 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.4.1 — GPS-first cross-platform location fallback
+
+- added automatic serial/USB NMEA GPS discovery
+- GPS is now the preferred location source on every supported desktop platform
+- parses valid RMC and GGA NMEA fixes
+- uses NMEA course/speed when available and a rough GGA HDOP-based accuracy display
+- added Qt Positioning as the platform system-location fallback
+- supports native/network-derived location fallback on Windows, macOS, and Linux when the platform backend is available
+- retained the direct Windows Location Services path as an additional Windows fallback
+- added `NAVCOM_GPS_PORT` and `NAVCOM_GPS_BAUD` overrides
+- header now distinguishes GPS, Windows, macOS, Linux, and fixed fallback location sources
+- added `pyserial` to runtime requirements
 
 ### v0.4.0 — Online-first hybrid map loading
 
