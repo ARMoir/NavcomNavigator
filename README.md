@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.6
+# NAV-COM 2006 — Navigator POC v0.3.7
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -26,7 +26,8 @@ are drawn directly by the application.
 - in-memory road-area cache
 - adaptive road detail at wide zoom levels
 - optional Pip-Boy-style boxed POI/landmark layer
-- POI filters for fuel, landmarks, and services
+- independent keyboard toggle for every POI category
+- live on-map POI legend showing each category ON/OFF
 - FOLLOW and FREE PAN modes
 - manual recentering
 - automatic speed/maneuver-based zoom
@@ -61,8 +62,12 @@ Enter an address or place in the destination box and press **Enter**.
 | Double-click map | Recenter on vehicle |
 | `+` / `-` | Zoom in/out |
 | `A` | Toggle AUTO ZOOM; enabling it recenters |
-| `P` | Toggle POI markers on/off |
-| `Shift+P` | Cycle POI filter: ALL → FUEL → LANDMARKS → SERVICES → OFF |
+| `G` | Toggle gas/fuel POIs |
+| `P` | Toggle parking POIs |
+| `F` | Toggle food POIs |
+| `M` | Toggle medical/pharmacy POIs |
+| `B` | Toggle lodging POIs |
+| `L` | Toggle landmark/attraction/historic POIs |
 | `Home` | Recenter |
 | `R` | Recenter while panned; reroute while following |
 | `F11` | Toggle fullscreen |
@@ -149,13 +154,31 @@ Marker density is zoom-aware. At wide zoom levels fewer markers are shown, and
 at very wide views the POI query is restricted to higher-value categories.
 Names appear beside markers only at closer zoom levels to keep the map legible.
 
-`P` toggles the layer without reloading the map. `Shift+P` cycles between
-ALL, FUEL, LANDMARKS, SERVICES, and OFF.
+Each POI category is independently controlled by the same letter used in its
+map icon: `G`, `P`, `F`, `M`, `B`, and `L`. Toggling a category
+does not reload map data; it only changes what is rendered from the current
+viewport cache.
+
+A compact on-map **POI LEGEND** shows all six categories and their current
+**ON/OFF** state. All categories start enabled.
 
 When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.7 — Individual POI controls and legend
+
+- replaced preset POI modes with six independent category toggles
+- `G` toggles fuel
+- `P` toggles parking
+- `F` toggles food
+- `M` toggles medical/pharmacy
+- `B` toggles lodging
+- `L` toggles landmarks/attractions/historic places
+- added a compact Pip-Boy-style on-map legend showing each category ON/OFF
+- POI toggles operate entirely on cached data and do not cause new map requests
+- map footer now summarizes how many POI categories are enabled
 
 ### v0.3.6 — Pip-Boy POI layer
 
