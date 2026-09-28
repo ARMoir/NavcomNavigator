@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.4.1
+# NAV-COM 2006 — Navigator POC v0.4.3
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -7,7 +7,9 @@ are drawn directly by the application.
 
 ## Features
 
-- USB/serial NMEA GPS as the preferred position source
+- configurable TCP/UDP network NMEA GPS input
+- USB/serial NMEA GPS fallback
+- in-app network GPS host/port settings with persistent preferences
 - cross-platform system-location fallback through Qt Positioning
 - direct Windows Location Services fallback when needed
 - real nearby OpenStreetMap road geometry
@@ -104,14 +106,16 @@ services in this version.
 
 ## GPS and location priority
 
-NAV-COM now prefers a real serial/USB GNSS receiver that outputs standard NMEA
-sentences. It automatically scans serial ports, prioritizes devices that look
-like GPS/GNSS receivers, and remembers the working port for the rest of the
-session.
+NAV-COM accepts standard NMEA data from either a configured network stream or
+a serial/USB GNSS receiver. A configured network endpoint is tried first; if it
+is disabled or unavailable, NAV-COM automatically continues down the fallback
+chain.
 
 The location priority is:
 
 ```text
+configured TCP/UDP network NMEA GPS
+        ↓ disabled / unavailable
 USB / serial NMEA GPS
         ↓ no valid fix
 platform system location
@@ -120,6 +124,27 @@ Windows direct Location Services fallback
         ↓ unavailable
 last known position / configured fallback
 ```
+
+The main window includes a compact **NET GPS** settings row with:
+
+- enable / disable
+- TCP or UDP
+- host / IP address
+- port
+- Apply
+
+Changes take effect without restarting NAV-COM and are saved using Qt's native
+settings store. The environment variable `NAVCOM_GPS_NETWORK` remains
+available as an optional initial default.
+
+For example, the NMEA stream:
+
+```text
+192.168.1.87:8080
+```
+
+can be entered directly as host `192.168.1.87`, port `8080`, protocol
+`TCP`, with **NET GPS** enabled.
 
 The platform system-location layer uses Qt Positioning. Depending on the
 operating system and available services, that can use native/network-derived
@@ -130,15 +155,25 @@ location such as Wi-Fi positioning:
 - macOS: the native Core Location backend when permission is available
 - Linux: the installed Qt/GeoClue positioning backend when available
 
-The header identifies the active source as `GPS LOCK`, `WIN LOC`,
-`MAC LOC`, `LINUX LOC`, or `LOC FALLBACK`.
+The header identifies the active source as `NET GPS`, `GPS LOCK`,
+`WIN LOC`, `MAC LOC`, `LINUX LOC`, or `LOC FALLBACK`.
 
 Most NMEA receivers use 9600 or 4800 baud, both of which NAV-COM tries
-automatically. You can force a serial device or baud rate with:
+automatically. You can force a serial device, baud rate, or network endpoint
+with:
 
 ```text
 NAVCOM_GPS_PORT
 NAVCOM_GPS_BAUD
+NAVCOM_GPS_NETWORK
+```
+
+Network endpoint examples:
+
+```text
+192.168.1.87:8080
+tcp://192.168.1.87:8080
+udp://192.168.1.87:8080
 ```
 
 For example on Windows:
@@ -279,6 +314,24 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.4.3 — In-app network GPS settings
+
+- added a compact NET GPS configuration row to the main window
+- host/IP and port can be changed without restarting
+- TCP/UDP can be selected from the UI
+- network NMEA can be enabled or disabled independently
+- settings persist through Qt's native settings store
+- UI settings override the optional environment default for the current session
+
+### v0.4.2 — Network NMEA GPS
+
+- added configurable TCP NMEA input
+- added UDP NMEA input
+- configured network GPS is preferred before serial GPS
+- network streams reuse the same GGA/RMC parser as USB/serial receivers
+- added `NAVCOM_GPS_NETWORK` configuration
+- header displays `NET GPS` while network NMEA is active
 
 ### v0.4.1 — GPS-first cross-platform location fallback
 
