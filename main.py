@@ -438,7 +438,9 @@ class NavDisplay(QWidget):
         half_diagonal_px = 0.5 * math.hypot(
             self.map_rect.width(), self.map_rect.height()
         )
-        radius = (half_diagonal_px / ppm) * MAP_PREFETCH_MARGIN
+        # Radius needed for the actual visible viewport. The network fetch
+        # adds a larger prefetch margin so small pans do not cause new calls.
+        radius = half_diagonal_px / ppm
         radius = max(MIN_MAP_RADIUS_M, min(MAX_MAP_RADIUS_M, radius))
         return center, radius, map_detail_for_radius(radius)
 
@@ -449,7 +451,7 @@ class NavDisplay(QWidget):
             # not the reverse.
             if entry.detail > detail:
                 continue
-            if haversine_m(entry.center, center) + radius <= entry.radius_m * 0.97:
+            if haversine_m(entry.center, center) + radius <= entry.radius_m:
                 candidates.append(entry)
         if not candidates:
             return None
@@ -483,9 +485,13 @@ class NavDisplay(QWidget):
         self.map_request_inflight = True
         self.map_refresh_pending = False
         self.s.loading = "LOADING ROADS"
+
+        # Fetch beyond the visible edge. The extra coverage is what lets the
+        # user pan a meaningful distance before another request is needed.
+        fetch_radius = min(MAX_MAP_RADIUS_M, radius * MAP_PREFETCH_MARGIN)
         threading.Thread(
             target=self._road_worker,
-            args=(center[0], center[1], radius, detail),
+            args=(center[0], center[1], fetch_radius, detail),
             daemon=True
         ).start()
         self.update()
