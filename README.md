@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.9
+# NAV-COM 2006 — Navigator POC v0.4.0
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -9,7 +9,7 @@ are drawn directly by the application.
 
 - Windows laptop geolocation
 - real nearby OpenStreetMap road geometry
-- automatic offline `.navmap` road/POI loading with online fallback
+- online-preferred map loading with fast offline preview/fallback
 - destination entry and explicit search on Enter
 - OSRM driving route calculation
 - full route geometry with bright-green active route
@@ -91,8 +91,12 @@ light personal testing:
 
 There is no autocomplete. Destination lookup only occurs when Enter is pressed.
 
-NAV-COM can now use local `.navmap` files for road geometry and POIs, with
-Overpass retained as an automatic fallback outside installed offline coverage.
+NAV-COM now prefers live Overpass road/POI data whenever it is available.
+If a local `.navmap` covers the current area, that database can be displayed
+immediately as a fast preview while the online request is still running. The
+online result replaces it as soon as it arrives. If the online request fails,
+the offline data remains as the fallback.
+
 Destination search and driving routes still use the public Nominatim and OSRM
 services in this version.
 
@@ -136,21 +140,31 @@ SQLite instead.
 
 ### Offline maps
 
-NAV-COM scans `offline_maps/*.navmap` when it starts. If the current map
-center falls inside an installed region, road geometry and POIs are read from
-that SQLite database automatically. If no installed map covers the area,
-NAV-COM falls back to the existing online Overpass loader.
+NAV-COM scans `offline_maps/*.navmap` when it starts. Online map data is the
+preferred source, but installed offline coverage is used in two situations:
+
+- as an immediate preview while the online map request is still loading
+- as the fallback if the online request fails
+
+If no offline map covers the area, NAV-COM simply waits for the normal online
+Overpass result.
 
 The footer identifies the active source, for example:
 
 ```text
-OFFLINE NEW ENGLAND
+OFFLINE PREVIEW NEW ENGLAND
 ```
 
-or:
+while live data is loading, then:
 
 ```text
 ONLINE
+```
+
+when the preferred source arrives. During an outage it shows:
+
+```text
+OFFLINE FALLBACK NEW ENGLAND
 ```
 
 The normal NAV-COM installation does not need any extra packages to **use**
@@ -221,6 +235,15 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.4.0 — Online-first hybrid map loading
+
+- live Overpass data is now the preferred road/POI source
+- installed navmaps can paint the viewport immediately while online data loads
+- online data replaces the offline preview as soon as it arrives
+- offline data remains in place when the online request fails
+- offline fallback cache entries are retried periodically so NAV-COM can return online after connectivity recovers
+- map footer distinguishes ONLINE, OFFLINE PREVIEW, and OFFLINE FALLBACK states
 
 ### v0.3.9 — Simple offline map database support
 
