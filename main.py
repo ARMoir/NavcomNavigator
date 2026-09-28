@@ -33,7 +33,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.4.3 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.4 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -786,6 +786,7 @@ def local_latlon(x_m, y_m, origin_lat, origin_lon):
 
 class NavDisplay(QWidget):
     destination_requested = Signal(str)
+    network_gps_status = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -879,8 +880,12 @@ class NavDisplay(QWidget):
             if not 1 <= port <= 65535:
                 raise ValueError("Network GPS port must be 1-65535")
             self._network_gps = f"{protocol}://{host}:{port}"
+            self.network_gps_status.emit(
+                f"CONNECTING {protocol.upper()} {host}:{port}"
+            )
         else:
             self._network_gps = None
+            self.network_gps_status.emit("NETWORK GPS DISABLED")
 
         # Re-evaluate immediately so a newly entered endpoint can take over
         # without requiring an application restart.
@@ -899,10 +904,17 @@ class NavDisplay(QWidget):
                 )
                 self._pending_heading = heading
                 self._pending_speed = speed
+                self.network_gps_status.emit(
+                    f"NET GPS ACTIVE {endpoint}"
+                )
                 self.bridge.location.emit(lat, lon, acc, "NETGPS")
                 return
             except Exception as exc:
-                errors.append("NETWORK GPS: " + str(exc))
+                message = str(exc)
+                errors.append("NETWORK GPS: " + message)
+                self.network_gps_status.emit(
+                    "NET GPS FAILED - USING FALLBACK"
+                )
 
         try:
             lat, lon, acc, heading, speed, port = get_nmea_location(
@@ -1983,6 +1995,19 @@ class MainWindow(QMainWindow):
         )
         self.net_gps_apply.clicked.connect(self.apply_network_gps_settings)
         self.net_gps_enabled.toggled.connect(self.update_network_gps_controls)
+        self.net_gps_enabled.toggled.connect(
+            lambda _checked: self.apply_network_gps_settings()
+        )
+        self.net_gps_host.returnPressed.connect(self.apply_network_gps_settings)
+        self.net_gps_port.editingFinished.connect(
+            self.save_network_gps_fields
+        )
+        self.net_gps_protocol.currentTextChanged.connect(
+            lambda _text: self.save_network_gps_fields()
+        )
+        self.display.network_gps_status.connect(
+            self.net_gps_status.setText
+        )
 
         layout.addWidget(self.search)
         layout.addWidget(gps_row)
@@ -1991,22 +2016,39 @@ class MainWindow(QMainWindow):
         shell.setStyleSheet("background:#010703;")
 
         self.update_network_gps_controls()
-        QTimer.singleShot(0, self.apply_network_gps_settings)
+        QTimer.singleShot(0, self.restore_network_gps_state)
 
     def update_network_gps_controls(self):
+        # Endpoint fields stay editable even while network GPS is disabled so
+        # the user can configure the connection before enabling it.
         enabled = self.net_gps_enabled.isChecked()
-        self.net_gps_protocol.setEnabled(enabled)
-        self.net_gps_host.setEnabled(enabled)
-        self.net_gps_port.setEnabled(enabled)
-        self.net_gps_status.setText(
-            "NETWORK NMEA ENABLED" if enabled else "NETWORK NMEA DISABLED"
-        )
+        self.net_gps_apply.setText("CONNECT" if enabled else "SAVE")
+        if not enabled:
+            self.net_gps_status.setText("NETWORK GPS DISABLED")
+
+    def save_network_gps_fields(self):
+        host = self.net_gps_host.text().strip()
+        port = self.net_gps_port.value()
+        protocol = self.net_gps_protocol.currentText().upper()
+        self.settings.setValue("network_gps/protocol", protocol)
+        self.settings.setValue("network_gps/host", host)
+        self.settings.setValue("network_gps/port", port)
+        self.settings.sync()
+
+    def restore_network_gps_state(self):
+        self.save_network_gps_fields()
+        if self.net_gps_enabled.isChecked():
+            self.apply_network_gps_settings()
 
     def apply_network_gps_settings(self):
         enabled = self.net_gps_enabled.isChecked()
         host = self.net_gps_host.text().strip()
         port = self.net_gps_port.value()
         protocol = self.net_gps_protocol.currentText().lower()
+
+        self.save_network_gps_fields()
+        self.settings.setValue("network_gps/enabled", enabled)
+        self.settings.sync()
 
         try:
             self.display.set_network_gps(
@@ -2016,18 +2058,8 @@ class MainWindow(QMainWindow):
             self.net_gps_status.setText("ERROR: " + str(exc).upper())
             return
 
-        self.settings.setValue("network_gps/enabled", enabled)
-        self.settings.setValue("network_gps/protocol", protocol.upper())
-        self.settings.setValue("network_gps/host", host)
-        self.settings.setValue("network_gps/port", port)
-        self.settings.sync()
-
-        if enabled:
-            self.net_gps_status.setText(
-                f"{protocol.upper()} {host}:{port}"
-            )
-        else:
-            self.net_gps_status.setText("NETWORK NMEA DISABLED")
+        if not enabled:
+            self.net_gps_status.setText("NETWORK GPS DISABLED")
 
 
 def main():
