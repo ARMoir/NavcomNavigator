@@ -29,7 +29,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3.9 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.0 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -40,6 +40,7 @@ MAX_MAP_RADIUS_M = 24000
 MAP_PREFETCH_MARGIN = 1.25
 MAP_FETCH_DEBOUNCE_MS = 350
 MAP_CACHE_LIMIT = 8
+OFFLINE_RETRY_S = 60
 POI_MIN_ZOOM = 0.55
 POI_MAX_DRAW = 36
 POI_ICONS = {
@@ -130,6 +131,7 @@ class NavState:
 
 class Bridge(QObject):
     location = Signal(float, float, float, str)
+    map_preview = Signal(object, object, float, float, float, int, str)
     roads = Signal(object, object, float, float, float, int, str)
     map_error = Signal(str)
     destination = Signal(float, float, str)
@@ -523,6 +525,7 @@ class NavDisplay(QWidget):
         self.s = NavState()
         self.bridge = Bridge()
         self.bridge.location.connect(self.on_location)
+        self.bridge.map_preview.connect(self.on_map_preview)
         self.bridge.roads.connect(self.on_roads)
         self.bridge.map_error.connect(self.on_map_error)
         self.bridge.destination.connect(self.on_destination)
@@ -682,15 +685,30 @@ class NavDisplay(QWidget):
 
     def _find_cached_map(self, center, radius, detail):
         candidates = []
+        now = time.time()
         for entry in self.road_cache:
             # A more detailed cache can satisfy a less-detailed request, but
             # not the reverse.
             if entry.detail > detail:
                 continue
+
+            # Online data is preferred. Offline fallback entries remain useful
+            # during an outage, but are retried periodically so NAV-COM can
+            # return to fresh online data when connectivity comes back.
+            if entry.source.startswith("OFFLINE"):
+                if now - entry.last_used > OFFLINE_RETRY_S:
+                    continue
+
             if haversine_m(entry.center, center) + radius <= entry.radius_m:
                 candidates.append(entry)
+
         if not candidates:
             return None
+
+        online = [entry for entry in candidates if entry.source.startswith("ONLINE")]
+        if online:
+            candidates = online
+
         return min(candidates, key=lambda e: e.radius_m)
 
     def _activate_map_entry(self, entry):
@@ -735,28 +753,63 @@ class NavDisplay(QWidget):
         self.update()
 
     def _road_worker(self, lat, lon, radius, detail):
-        try:
-            region = find_offline_map(self.offline_maps, lat, lon)
-            source = "ONLINE"
-            if region is not None:
-                try:
-                    roads, pois = query_offline_map(region, lat, lon, radius, detail)
-                    if roads:
-                        source = "OFFLINE " + region.name.upper()
-                    else:
-                        roads, pois = fetch_map_data(lat, lon, radius, detail)
-                        source = "ONLINE FALLBACK"
-                except Exception:
-                    roads, pois = fetch_map_data(lat, lon, radius, detail)
-                    source = "ONLINE FALLBACK"
-            else:
-                roads, pois = fetch_map_data(lat, lon, radius, detail)
+        region = find_offline_map(self.offline_maps, lat, lon)
+        offline_data = None
 
+        # If local coverage exists, use it as a fast startup/viewport preview
+        # while the preferred online request runs in the same worker.
+        if region is not None:
+            try:
+                offline_roads, offline_pois = query_offline_map(
+                    region, lat, lon, radius, detail
+                )
+                if offline_roads:
+                    offline_data = (offline_roads, offline_pois)
+                    self.bridge.map_preview.emit(
+                        offline_roads,
+                        offline_pois,
+                        lat,
+                        lon,
+                        radius,
+                        detail,
+                        "OFFLINE PREVIEW " + region.name.upper()
+                    )
+            except Exception:
+                offline_data = None
+
+        try:
+            roads, pois = fetch_map_data(lat, lon, radius, detail)
             self.bridge.roads.emit(
-                roads, pois, lat, lon, radius, detail, source
+                roads, pois, lat, lon, radius, detail, "ONLINE"
             )
         except Exception as exc:
-            self.bridge.map_error.emit("MAP: " + str(exc))
+            if offline_data is not None:
+                roads, pois = offline_data
+                self.bridge.roads.emit(
+                    roads,
+                    pois,
+                    lat,
+                    lon,
+                    radius,
+                    detail,
+                    "OFFLINE FALLBACK " + region.name.upper()
+                )
+            else:
+                self.bridge.map_error.emit("MAP: " + str(exc))
+
+    def on_map_preview(self, roads, pois, lat, lon, radius, detail, source):
+        # Preview data is intentionally not added to the long-lived cache.
+        # It keeps the screen useful while the preferred online request is
+        # still in flight, then gets replaced by the online result.
+        self.s.roads = roads
+        self.s.pois = pois
+        self.s.last_map_center = (lat, lon)
+        self.loaded_map_center = (lat, lon)
+        self.loaded_map_radius_m = radius
+        self.loaded_map_detail = detail
+        self.loaded_map_source = source
+        self.s.loading = "LOADING ONLINE"
+        self.update()
 
     def on_roads(self, roads, pois, lat, lon, radius, detail, source):
         self.map_request_inflight = False
@@ -1164,9 +1217,10 @@ class NavDisplay(QWidget):
         if self.s.loading and not self.s.roads:
             p.setFont(self.mono(17,True))
             p.drawText(r,Qt.AlignCenter,self.s.loading+"...")
-        elif self.s.loading == "LOADING MAP":
+        elif self.s.loading in ("LOADING MAP", "LOADING ONLINE"):
             p.setPen(BRIGHT); p.setFont(self.mono(8,True))
-            p.drawText(int(r.right()-105), int(r.top()+18), "[ MAP LOAD ]")
+            label = "[ ONLINE ]" if self.s.loading == "LOADING ONLINE" else "[ MAP LOAD ]"
+            p.drawText(int(r.right()-105), int(r.top()+18), label)
         elif not self.s.roads:
             p.setFont(self.mono(15,True))
             p.drawText(r,Qt.AlignCenter,"NO ROAD GEOMETRY - CHECK MAP SERVICE")
