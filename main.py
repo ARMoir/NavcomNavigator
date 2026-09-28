@@ -741,7 +741,11 @@ class NavDisplay(QWidget):
             if region is not None:
                 try:
                     roads, pois = query_offline_map(region, lat, lon, radius, detail)
-                    source = "OFFLINE " + region.name.upper()
+                    if roads:
+                        source = "OFFLINE " + region.name.upper()
+                    else:
+                        roads, pois = fetch_map_data(lat, lon, radius, detail)
+                        source = "ONLINE FALLBACK"
                 except Exception:
                     roads, pois = fetch_map_data(lat, lon, radius, detail)
                     source = "ONLINE FALLBACK"
