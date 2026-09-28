@@ -27,7 +27,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3.7 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.3.8 (personal navigation proof-of-concept)"
 
 MAP_RADIUS_M = 4200
 MIN_MAP_RADIUS_M = 2500
@@ -412,6 +412,8 @@ class NavDisplay(QWidget):
         self.dragging = False
         self.drag_last = QPointF()
         self.map_rect = QRectF()
+        self.poi_legend_rect = QRectF()
+        self.poi_legend_collapsed = False
         self.poi_enabled = {
             "FUEL": True,
             "PARKING": True,
@@ -704,7 +706,7 @@ class NavDisplay(QWidget):
             self.update()
 
     def draw_poi_legend(self, p, r):
-        """Compact Pip-Boy-style POI legend with live ON/OFF state."""
+        """Small clickable Pip-Boy-style POI legend."""
         items = [
             ("G", "FUEL", "FUEL"),
             ("P", "PARK", "PARKING"),
@@ -714,12 +716,36 @@ class NavDisplay(QWidget):
             ("L", "LAND", "LANDMARK"),
         ]
 
-        box_w = 182
-        row_h = 20
-        box_h = 22 + row_h * len(items)
-        x = r.right() - box_w - 12
-        y = r.top() + 12
+        enabled_count = sum(1 for value in self.poi_enabled.values() if value)
+        x_margin = 8
+        y_margin = 8
+
+        if self.poi_legend_collapsed:
+            box_w = 92
+            box_h = 20
+            x = r.right() - box_w - x_margin
+            y = r.top() + y_margin
+            box = QRectF(x, y, box_w, box_h)
+            self.poi_legend_rect = box
+
+            p.save()
+            p.fillRect(box, QColor(1, 7, 3, 225))
+            p.setPen(QPen(DIM, 1))
+            p.drawRect(box)
+            p.setPen(GREEN)
+            p.setFont(self.mono(7, True))
+            p.drawText(int(x+6), int(y+13), f"POI {enabled_count}/6 [+]")
+            p.restore()
+            return
+
+        box_w = 118
+        row_h = 14
+        header_h = 18
+        box_h = header_h + row_h * len(items) + 4
+        x = r.right() - box_w - x_margin
+        y = r.top() + y_margin
         box = QRectF(x, y, box_w, box_h)
+        self.poi_legend_rect = box
 
         p.save()
         p.fillRect(box, QColor(1, 7, 3, 225))
@@ -727,26 +753,26 @@ class NavDisplay(QWidget):
         p.drawRect(box)
 
         p.setPen(GREEN)
-        p.setFont(self.mono(8, True))
-        p.drawText(int(x+8), int(y+14), "POI LEGEND")
+        p.setFont(self.mono(7, True))
+        p.drawText(int(x+6), int(y+12), f"POI {enabled_count}/6  [-]")
 
-        yy = y + 32
+        yy = y + header_h + 9
         for glyph, label, category in items:
             enabled = self.poi_enabled.get(category, False)
 
-            icon = QRectF(x+8, yy-11, 16, 16)
+            icon = QRectF(x+6, yy-8, 12, 12)
             p.setPen(QPen(BRIGHT if enabled else FAINT, 1))
             p.drawRect(icon)
-            p.setFont(self.mono(8, True))
+            p.setFont(self.mono(6, True))
             p.drawText(icon, Qt.AlignCenter, glyph)
 
             p.setPen(GREEN if enabled else FAINT)
-            p.setFont(self.mono(8, True))
-            p.drawText(int(x+31), int(yy+1), label)
+            p.setFont(self.mono(6, True))
+            p.drawText(int(x+23), int(yy+1), label)
 
             state = "ON" if enabled else "OFF"
             p.setPen(BRIGHT if enabled else DIM)
-            p.drawText(int(x+143), int(yy+1), state)
+            p.drawText(int(x+91), int(yy+1), state)
             yy += row_h
 
         p.restore()
@@ -1098,6 +1124,11 @@ class NavDisplay(QWidget):
         super().wheelEvent(e)
 
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.poi_legend_rect.contains(e.position()):
+            self.poi_legend_collapsed = not self.poi_legend_collapsed
+            self.update()
+            e.accept()
+            return
         if e.button() == Qt.LeftButton and self.map_rect.contains(e.position()):
             self.dragging = True
             self.drag_last = e.position()
