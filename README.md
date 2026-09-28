@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.4.3
+# NAV-COM 2006 — Navigator POC v0.4.4
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -131,8 +131,14 @@ The main window includes a compact **NET GPS** settings row with:
 - TCP or UDP
 - host / IP address
 - port
-- Apply
+- Connect / Save
 
+The host, port, and protocol remain editable even when NET GPS is disabled, so
+you can configure the endpoint first and then enable it. Pressing Enter in the
+host field or clicking **CONNECT** applies the current values immediately.
+
+The status text now reports the real connection state, including
+`CONNECTING`, `NET GPS ACTIVE`, or `NET GPS FAILED - USING FALLBACK`.
 Changes take effect without restarting NAV-COM and are saved using Qt's native
 settings store. The environment variable `NAVCOM_GPS_NETWORK` remains
 available as an optional initial default.
@@ -314,6 +320,16 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.4.4 — Simplified network GPS setup
+
+- host/IP, port, and protocol remain editable while NET GPS is disabled
+- NET GPS checkbox now immediately enables or disables the network source
+- CONNECT applies the currently displayed endpoint without restarting
+- pressing Enter in the host field applies the endpoint
+- settings are saved independently from whether network GPS is enabled
+- status text now reports CONNECTING, ACTIVE, or fallback after failure
+- disabling network GPS immediately returns to serial/system location fallback
 
 ### v0.4.3 — In-app network GPS settings
 
