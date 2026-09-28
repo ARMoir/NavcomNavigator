@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.4.4
+# NAV-COM 2006 — Navigator POC v0.4.5
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -320,6 +320,14 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.4.5 — Correct NMEA speed and heading
+
+- NMEA readers now wait briefly for RMC after an earlier GGA sentence
+- GGA contributes fix quality/HDOP-derived accuracy while RMC contributes speed/course
+- zero speed and zero course from RMC are treated as valid values
+- stationary NMEA sources no longer fall back to jitter-derived speed/heading
+- serial and network NMEA paths use the same merged-fix behavior
 
 ### v0.4.4 — Simplified network GPS setup
 
