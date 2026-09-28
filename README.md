@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.4
+# NAV-COM 2006 — Navigator POC v0.3.5
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -17,6 +17,7 @@ are drawn directly by the application.
 - speed and heading from Windows when available
 - movement-derived heading/speed fallback
 - periodic position refresh
+- live GPS latitude/longitude readout
 - off-route detection and automatic rerouting
 - live phosphor digital clock and date
 - scrolling compass tape with N / E / S / W, degree ticks, and fixed lubber line
@@ -127,6 +128,12 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.5 — GPS coordinate readout
+
+- added live latitude and longitude beneath the GPS accuracy readout
+- coordinates are shown to six decimal places
+- adjusted destination text placement to preserve panel spacing
 
 ### v0.3.4 — Viewport-aware map loading
 
