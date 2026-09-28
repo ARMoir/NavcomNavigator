@@ -27,9 +27,14 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.3.4 (personal navigation proof-of-concept)"
 
 MAP_RADIUS_M = 4200
+MIN_MAP_RADIUS_M = 2500
+MAX_MAP_RADIUS_M = 24000
+MAP_PREFETCH_MARGIN = 1.25
+MAP_FETCH_DEBOUNCE_MS = 350
+MAP_CACHE_LIMIT = 8
 LOCATION_POLL_MS = 4000
 OFF_ROUTE_METERS = 80
 REROUTE_COOLDOWN_S = 15
@@ -40,6 +45,15 @@ class Road:
     points: list
     name: str = ""
     highway: str = ""
+
+
+@dataclass
+class MapCacheEntry:
+    center: tuple
+    radius_m: float
+    detail: int
+    roads: list
+    last_used: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -76,7 +90,8 @@ class NavState:
 
 class Bridge(QObject):
     location = Signal(float, float, float, str)
-    roads = Signal(object, float, float)
+    roads = Signal(object, float, float, float, int)
+    map_error = Signal(str)
     destination = Signal(float, float, str)
     route = Signal(object, object, float, float)
     error = Signal(str)
@@ -121,13 +136,40 @@ def get_windows_location():
     return asyncio.run(locate())
 
 
-def fetch_roads(lat, lon, radius_m=MAP_RADIUS_M):
+def map_detail_for_radius(radius_m):
+    """Return 0=local/all drivable roads, 1=regional, 2=major roads only."""
+    if radius_m <= 7000:
+        return 0
+    if radius_m <= 15000:
+        return 1
+    return 2
+
+
+def fetch_roads(lat, lon, radius_m=MAP_RADIUS_M, detail=0):
+    # Large zoomed-out views intentionally request less road detail. This
+    # keeps public Overpass use reasonable while preserving useful context.
+    if detail == 0:
+        selector = (
+            '["highway"]'
+            '["highway"!~"footway|path|steps|cycleway|bridleway|corridor|'
+            'construction|proposed"]'
+        )
+    elif detail == 1:
+        selector = (
+            '["highway"~"motorway|motorway_link|trunk|trunk_link|primary|'
+            'primary_link|secondary|secondary_link|tertiary|tertiary_link|'
+            'unclassified"]'
+        )
+    else:
+        selector = (
+            '["highway"~"motorway|motorway_link|trunk|trunk_link|primary|'
+            'primary_link|secondary|secondary_link"]'
+        )
+
     query = f"""
     [out:json][timeout:25];
     (
-      way(around:{radius_m},{lat},{lon})
-        ["highway"]
-        ["highway"!~"footway|path|steps|cycleway|bridleway|corridor|construction|proposed"];
+      way(around:{int(radius_m)},{lat},{lon}){selector};
     );
     out tags geom;
     """
@@ -242,6 +284,13 @@ def local_xy(lat, lon, origin_lat, origin_lon):
     return x, y
 
 
+def local_latlon(x_m, y_m, origin_lat, origin_lon):
+    lat = origin_lat - (y_m / 111320.0)
+    cos_lat = max(0.01, math.cos(math.radians(origin_lat)))
+    lon = origin_lon + (x_m / (111320.0 * cos_lat))
+    return lat, lon
+
+
 class NavDisplay(QWidget):
     destination_requested = Signal(str)
 
@@ -251,6 +300,7 @@ class NavDisplay(QWidget):
         self.bridge = Bridge()
         self.bridge.location.connect(self.on_location)
         self.bridge.roads.connect(self.on_roads)
+        self.bridge.map_error.connect(self.on_map_error)
         self.bridge.destination.connect(self.on_destination)
         self.bridge.route.connect(self.on_route)
         self.bridge.error.connect(self.on_error)
@@ -265,6 +315,19 @@ class NavDisplay(QWidget):
         self.dragging = False
         self.drag_last = QPointF()
         self.map_rect = QRectF()
+
+        # Viewport-aware map cache. A cached circle can satisfy future pans or
+        # zooms without another network request when it fully covers the view.
+        self.road_cache = []
+        self.map_request_inflight = False
+        self.map_refresh_pending = False
+        self.loaded_map_radius_m = 0.0
+        self.loaded_map_detail = 0
+        self.loaded_map_center = None
+
+        self.map_refresh_timer = QTimer(self)
+        self.map_refresh_timer.setSingleShot(True)
+        self.map_refresh_timer.timeout.connect(self.ensure_map_coverage)
 
         self.poll = QTimer(self)
         self.poll.timeout.connect(self.acquire_location)
@@ -337,10 +400,8 @@ class NavDisplay(QWidget):
                 target_zoom = 1.15
             self.zoom += (target_zoom - self.zoom) * 0.25
 
-        if (self.s.last_map_center is None or
-                haversine_m(self.s.last_map_center, new) > 1200):
-            self.s.loading = "LOADING ROADS"
-            threading.Thread(target=self._road_worker, args=(lat, lon), daemon=True).start()
+        # Map coverage follows the visible viewport, not just the vehicle.
+        self.ensure_map_coverage()
 
         if self.s.destination and self.s.route:
             off = distance_to_route_m(new, self.s.route)
@@ -350,15 +411,118 @@ class NavDisplay(QWidget):
 
         self.update()
 
-    def _road_worker(self, lat, lon):
-        try:
-            self.bridge.roads.emit(fetch_roads(lat, lon), lat, lon)
-        except Exception as exc:
-            self.bridge.error.emit("MAP: " + str(exc))
+    def map_view_request(self):
+        """Return viewport center, required prefetch radius, and detail tier."""
+        if self.map_rect.width() < 100 or self.map_rect.height() < 100:
+            center = (self.s.lat, self.s.lon)
+            radius = MAP_RADIUS_M
+            return center, radius, map_detail_for_radius(radius)
 
-    def on_roads(self, roads, lat, lon):
-        self.s.roads = roads
-        self.s.last_map_center = (lat, lon)
+        ppm = (min(self.map_rect.width(), self.map_rect.height()) / 7000.0) * max(0.01, self.zoom)
+        safe_heading = self.s.heading_deg if math.isfinite(self.s.heading_deg) else 0.0
+
+        pan = self.pan_px if not self.follow_vehicle else QPointF(0, 0)
+        sx = -pan.x()
+        sy = -pan.y()
+        a = math.radians(safe_heading)
+        world_px_x = math.cos(a) * sx - math.sin(a) * sy
+        world_px_y = math.sin(a) * sx + math.cos(a) * sy
+
+        center = local_latlon(
+            world_px_x / ppm,
+            world_px_y / ppm,
+            self.s.lat,
+            self.s.lon
+        )
+
+        half_diagonal_px = 0.5 * math.hypot(
+            self.map_rect.width(), self.map_rect.height()
+        )
+        radius = (half_diagonal_px / ppm) * MAP_PREFETCH_MARGIN
+        radius = max(MIN_MAP_RADIUS_M, min(MAX_MAP_RADIUS_M, radius))
+        return center, radius, map_detail_for_radius(radius)
+
+    def _find_cached_map(self, center, radius, detail):
+        candidates = []
+        for entry in self.road_cache:
+            # A more detailed cache can satisfy a less-detailed request, but
+            # not the reverse.
+            if entry.detail > detail:
+                continue
+            if haversine_m(entry.center, center) + radius <= entry.radius_m * 0.97:
+                candidates.append(entry)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda e: e.radius_m)
+
+    def _activate_map_entry(self, entry):
+        entry.last_used = time.time()
+        self.s.roads = entry.roads
+        self.s.last_map_center = entry.center
+        self.loaded_map_center = entry.center
+        self.loaded_map_radius_m = entry.radius_m
+        self.loaded_map_detail = entry.detail
+        self.s.loading = ""
+        self.update()
+
+    def schedule_map_refresh(self, delay_ms=MAP_FETCH_DEBOUNCE_MS):
+        if hasattr(self, "map_refresh_timer"):
+            self.map_refresh_timer.start(max(0, int(delay_ms)))
+
+    def ensure_map_coverage(self):
+        center, radius, detail = self.map_view_request()
+        cached = self._find_cached_map(center, radius, detail)
+        if cached is not None:
+            self._activate_map_entry(cached)
+            return
+
+        if self.map_request_inflight:
+            self.map_refresh_pending = True
+            return
+
+        self.map_request_inflight = True
+        self.map_refresh_pending = False
+        self.s.loading = "LOADING ROADS"
+        threading.Thread(
+            target=self._road_worker,
+            args=(center[0], center[1], radius, detail),
+            daemon=True
+        ).start()
+        self.update()
+
+    def _road_worker(self, lat, lon, radius, detail):
+        try:
+            roads = fetch_roads(lat, lon, radius, detail)
+            self.bridge.roads.emit(roads, lat, lon, radius, detail)
+        except Exception as exc:
+            self.bridge.map_error.emit("MAP: " + str(exc))
+
+    def on_roads(self, roads, lat, lon, radius, detail):
+        self.map_request_inflight = False
+        entry = MapCacheEntry(
+            center=(lat, lon),
+            radius_m=radius,
+            detail=detail,
+            roads=roads
+        )
+        self.road_cache.append(entry)
+        self.road_cache.sort(key=lambda e: e.last_used, reverse=True)
+        del self.road_cache[MAP_CACHE_LIMIT:]
+
+        # Re-evaluate the current viewport. If the user moved while the query
+        # was running, the result is retained in cache and a second request is
+        # made only if the new viewport is not covered.
+        self.s.loading = ""
+        pending = self.map_refresh_pending
+        self.map_refresh_pending = False
+        self.ensure_map_coverage()
+        if pending:
+            self.schedule_map_refresh(50)
+
+    def on_map_error(self, message):
+        self.map_request_inflight = False
+        self.map_refresh_pending = False
+        self.s.error = message
         self.s.loading = ""
         self.update()
 
@@ -565,15 +729,22 @@ class NavDisplay(QWidget):
         az = "AUTO" if self.auto_zoom else "MANUAL"
         p.drawText(int(r.left()+14),int(r.bottom()-14),
                    f"{mode}   ZOOM {self.zoom:0.2f}X {az}   +/- ZOOM   A AUTO")
+        p.setPen(DIM); p.setFont(self.mono(7,True))
+        detail_name = ("LOCAL", "REGIONAL", "MAJOR")[min(2, self.loaded_map_detail)]
+        p.drawText(int(r.left()+14),int(r.bottom()-29),
+                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}")
         if not self.follow_vehicle:
             label = "[ RECENTER ]"
             tw = p.fontMetrics().horizontalAdvance(label)
             p.setPen(BRIGHT)
             p.drawText(int(r.right()-tw-14),int(r.bottom()-14),label)
 
-        if self.s.loading:
+        if self.s.loading and not self.s.roads:
             p.setFont(self.mono(17,True))
             p.drawText(r,Qt.AlignCenter,self.s.loading+"...")
+        elif self.s.loading == "LOADING ROADS":
+            p.setPen(BRIGHT); p.setFont(self.mono(8,True))
+            p.drawText(int(r.right()-105), int(r.top()+18), "[ MAP LOAD ]")
         elif not self.s.roads:
             p.setFont(self.mono(15,True))
             p.drawText(r,Qt.AlignCenter,"NO ROAD GEOMETRY - CHECK MAP SERVICE")
@@ -656,11 +827,13 @@ class NavDisplay(QWidget):
     def set_manual_zoom(self, factor):
         self.auto_zoom = False
         self.zoom = max(0.30, min(5.0, self.zoom * factor))
+        self.schedule_map_refresh()
         self.update()
 
     def recenter(self):
         self.follow_vehicle = True
         self.pan_px = QPointF(0, 0)
+        self.schedule_map_refresh(0)
         self.update()
 
     def wheelEvent(self, e):
@@ -686,6 +859,7 @@ class NavDisplay(QWidget):
             delta = e.position() - self.drag_last
             self.pan_px += delta
             self.drag_last = e.position()
+            self.schedule_map_refresh()
             self.update()
             e.accept()
             return
@@ -695,6 +869,7 @@ class NavDisplay(QWidget):
         if e.button() == Qt.LeftButton and self.dragging:
             self.dragging = False
             self.unsetCursor()
+            self.schedule_map_refresh(0)
             e.accept()
             return
         super().mouseReleaseEvent(e)
@@ -705,6 +880,10 @@ class NavDisplay(QWidget):
             e.accept()
             return
         super().mouseDoubleClickEvent(e)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.schedule_map_refresh()
 
     def keyPressEvent(self,e):
         if e.key()==Qt.Key_F11:
