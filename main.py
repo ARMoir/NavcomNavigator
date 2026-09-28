@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtPositioning import QGeoPositionInfo, QGeoPositionInfoSource
 from PySide6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QMessageBox, QVBoxLayout, QWidget
 )
@@ -29,7 +31,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.4.0 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.1 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -52,6 +54,9 @@ POI_ICONS = {
     "LANDMARK": "L",
 }
 LOCATION_POLL_MS = 4000
+GPS_SCAN_TIMEOUT_S = 2.0
+GPS_DEFAULT_BAUDS = (9600, 4800)
+SYSTEM_LOCATION_TIMEOUT_MS = 3500
 OFF_ROUTE_METERS = 80
 REROUTE_COOLDOWN_S = 15
 
@@ -131,6 +136,7 @@ class NavState:
 
 class Bridge(QObject):
     location = Signal(float, float, float, str)
+    system_location_request = Signal(str)
     map_preview = Signal(object, object, float, float, float, int, str)
     roads = Signal(object, object, float, float, float, int, str)
     map_error = Signal(str)
@@ -146,6 +152,160 @@ def request_json(url, params=None, data=None, timeout=30):
     req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
+
+
+def nmea_coord(value, hemisphere):
+    if not value:
+        raise ValueError("empty NMEA coordinate")
+    raw = float(value)
+    degrees = int(raw // 100)
+    minutes = raw - degrees * 100
+    result = degrees + minutes / 60.0
+    if hemisphere in ("S", "W"):
+        result = -result
+    return result
+
+
+def parse_nmea_sentence(line):
+    if not line.startswith("$"):
+        return None
+
+    body = line.split("*", 1)[0]
+    fields = body.split(",")
+    sentence = fields[0][-3:]
+
+    if sentence == "RMC" and len(fields) >= 9:
+        if fields[2] != "A":
+            return None
+        return {
+            "lat": nmea_coord(fields[3], fields[4]),
+            "lon": nmea_coord(fields[5], fields[6]),
+            "speed_mps": float(fields[7] or 0.0) * 0.514444,
+            "heading": float(fields[8] or 0.0),
+            "accuracy_m": 0.0,
+        }
+
+    if sentence == "GGA" and len(fields) >= 9:
+        if int(fields[6] or 0) <= 0:
+            return None
+        hdop = float(fields[8] or 0.0)
+        return {
+            "lat": nmea_coord(fields[2], fields[3]),
+            "lon": nmea_coord(fields[4], fields[5]),
+            "speed_mps": 0.0,
+            "heading": 0.0,
+            "accuracy_m": hdop * 5.0 if hdop > 0 else 0.0,
+        }
+
+    return None
+
+
+def gps_candidate_ports(preferred_port=None):
+    import serial.tools.list_ports
+
+    configured = os.environ.get("NAVCOM_GPS_PORT", "").strip()
+    ports = list(serial.tools.list_ports.comports())
+    ordered = []
+
+    for name in (configured, preferred_port):
+        if name and name not in ordered:
+            ordered.append(name)
+
+    def gps_score(port):
+        text = " ".join(
+            str(value or "")
+            for value in (
+                port.device,
+                port.description,
+                port.manufacturer,
+                port.product,
+            )
+        ).lower()
+        return 0 if any(
+            token in text
+            for token in ("gps", "gnss", "u-blox", "ublox", "garmin")
+        ) else 1
+
+    for port in sorted(ports, key=gps_score):
+        if port.device not in ordered:
+            ordered.append(port.device)
+
+    return ordered
+
+
+def get_nmea_location(preferred_port=None, timeout_s=GPS_SCAN_TIMEOUT_S):
+    import serial
+
+    ports = gps_candidate_ports(preferred_port)
+    if not ports:
+        raise RuntimeError("no serial GPS ports found")
+
+    configured_baud = os.environ.get("NAVCOM_GPS_BAUD", "").strip()
+    bauds = []
+    if configured_baud:
+        try:
+            bauds.append(int(configured_baud))
+        except ValueError:
+            pass
+    for baud in GPS_DEFAULT_BAUDS:
+        if baud not in bauds:
+            bauds.append(baud)
+
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+
+    for port in ports:
+        for baud in bauds:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                with serial.Serial(port, baudrate=baud, timeout=0.25) as gps:
+                    best = None
+                    port_deadline = min(deadline, time.monotonic() + 0.9)
+
+                    while time.monotonic() < port_deadline:
+                        raw = gps.readline()
+                        if not raw:
+                            continue
+                        fix = parse_nmea_sentence(
+                            raw.decode("ascii", errors="ignore").strip()
+                        )
+                        if not fix:
+                            continue
+
+                        if best is None:
+                            best = fix
+                        else:
+                            best["lat"] = fix["lat"]
+                            best["lon"] = fix["lon"]
+                            if fix["accuracy_m"] > 0:
+                                best["accuracy_m"] = fix["accuracy_m"]
+                            if fix["speed_mps"] > 0:
+                                best["speed_mps"] = fix["speed_mps"]
+                            if fix["heading"] > 0:
+                                best["heading"] = fix["heading"]
+
+                        # One valid NMEA fix is enough to establish GPS as the
+                        # preferred source. Additional motion/accuracy values
+                        # will arrive during later polls.
+                        if best is not None:
+                            return (
+                                best["lat"],
+                                best["lon"],
+                                best["accuracy_m"],
+                                best["heading"],
+                                best["speed_mps"],
+                                port,
+                            )
+            except Exception as exc:
+                last_error = exc
+
+        if time.monotonic() >= deadline:
+            break
+
+    if last_error:
+        raise RuntimeError(f"GPS unavailable: {last_error}")
+    raise RuntimeError("GPS found but no valid NMEA fix")
 
 
 def get_windows_location():
@@ -525,6 +685,7 @@ class NavDisplay(QWidget):
         self.s = NavState()
         self.bridge = Bridge()
         self.bridge.location.connect(self.on_location)
+        self.bridge.system_location_request.connect(self.request_system_location)
         self.bridge.map_preview.connect(self.on_map_preview)
         self.bridge.roads.connect(self.on_roads)
         self.bridge.map_error.connect(self.on_map_error)
@@ -563,6 +724,24 @@ class NavDisplay(QWidget):
         self.loaded_map_center = None
         self.loaded_map_source = "ONLINE"
         self.offline_maps = discover_offline_maps()
+        self._gps_port = os.environ.get("NAVCOM_GPS_PORT", "").strip() or None
+        self._gps_error = ""
+        self._system_location_pending = False
+
+        self.system_position_source = QGeoPositionInfoSource.createDefaultSource(self)
+        if self.system_position_source is not None:
+            try:
+                self.system_position_source.setPreferredPositioningMethods(
+                    QGeoPositionInfoSource.PositioningMethod.NonSatellitePositioningMethods
+                )
+            except Exception:
+                pass
+            self.system_position_source.positionUpdated.connect(
+                self.on_system_position
+            )
+            self.system_position_source.errorOccurred.connect(
+                self.on_system_location_error
+            )
 
         self.map_refresh_timer = QTimer(self)
         self.map_refresh_timer.setSingleShot(True)
@@ -583,14 +762,134 @@ class NavDisplay(QWidget):
 
     def _location_worker(self):
         try:
+            lat, lon, acc, heading, speed, port = get_nmea_location(
+                self._gps_port
+            )
+            self._gps_port = port
+            self._pending_heading = heading
+            self._pending_speed = speed
+            self.bridge.location.emit(lat, lon, acc, "GPS")
+            return
+        except Exception as exc:
+            self.bridge.system_location_request.emit(str(exc))
+
+    def request_system_location(self, gps_error=""):
+        self._gps_error = gps_error
+
+        if self.system_position_source is not None:
+            if not self._system_location_pending:
+                self._system_location_pending = True
+                self.system_position_source.requestUpdate(
+                    SYSTEM_LOCATION_TIMEOUT_MS
+                )
+            return
+
+        if sys.platform.startswith("win"):
+            threading.Thread(
+                target=self._windows_location_worker,
+                daemon=True
+            ).start()
+            return
+
+        self._location_fallback(
+            f"GPS: {gps_error}; no system location source"
+        )
+
+    def _windows_location_worker(self):
+        try:
             lat, lon, acc, heading, speed = get_windows_location()
             self._pending_heading = heading
             self._pending_speed = speed
             self.bridge.location.emit(lat, lon, acc, "WINDOWS")
         except Exception as exc:
-            if self.s.last_position is None:
-                self.bridge.location.emit(FALLBACK_LAT, FALLBACK_LON, 0, "FALLBACK")
-            self.bridge.error.emit("LOCATION: " + str(exc))
+            self._location_fallback(
+                f"GPS: {self._gps_error}; WINDOWS: {exc}"
+            )
+
+    def on_system_position(self, info):
+        self._system_location_pending = False
+        if not info or not info.isValid():
+            self._location_fallback(
+                f"GPS: {self._gps_error}; invalid system location"
+            )
+            return
+
+        coord = info.coordinate()
+        if not coord.isValid():
+            self._location_fallback(
+                f"GPS: {self._gps_error}; invalid system coordinate"
+            )
+            return
+
+        attr = QGeoPositionInfo.Attribute
+        accuracy = (
+            float(info.attribute(attr.HorizontalAccuracy))
+            if info.hasAttribute(attr.HorizontalAccuracy) else 0.0
+        )
+        heading = (
+            float(info.attribute(attr.Direction))
+            if info.hasAttribute(attr.Direction) else 0.0
+        )
+        speed = (
+            float(info.attribute(attr.GroundSpeed))
+            if info.hasAttribute(attr.GroundSpeed) else 0.0
+        )
+
+        for value_name, value in (
+            ("accuracy", accuracy),
+            ("heading", heading),
+            ("speed", speed),
+        ):
+            if not math.isfinite(value):
+                if value_name == "accuracy":
+                    accuracy = 0.0
+                elif value_name == "heading":
+                    heading = 0.0
+                else:
+                    speed = 0.0
+
+        if sys.platform.startswith("win"):
+            source = "WINDOWS"
+        elif sys.platform == "darwin":
+            source = "MACOS"
+        elif sys.platform.startswith("linux"):
+            source = "LINUX"
+        else:
+            source = "SYSTEM"
+
+        self._pending_heading = heading
+        self._pending_speed = speed
+        self.bridge.location.emit(
+            float(coord.latitude()),
+            float(coord.longitude()),
+            accuracy,
+            source
+        )
+
+    def on_system_location_error(self, _error):
+        if not self._system_location_pending:
+            return
+        self._system_location_pending = False
+
+        # Windows gets one extra direct WinRT attempt because that was the
+        # original NAV-COM fallback and can work even when a Qt positioning
+        # plugin is unavailable or misconfigured.
+        if sys.platform.startswith("win"):
+            threading.Thread(
+                target=self._windows_location_worker,
+                daemon=True
+            ).start()
+        else:
+            self._location_fallback(
+                f"GPS: {self._gps_error}; system location unavailable"
+            )
+
+    def _location_fallback(self, message):
+        if self.s.last_position is None:
+            self.bridge.location.emit(
+                FALLBACK_LAT, FALLBACK_LON, 0, "FALLBACK"
+            )
+        self.bridge.error.emit("LOCATION: " + message)
 
     def on_location(self, lat, lon, accuracy, source):
         now = time.time()
@@ -1069,7 +1368,14 @@ class NavDisplay(QWidget):
         p.setFont(self.mono(18, True))
         p.drawText(m+7, m+29, "NAV-COM 2006")
 
-        status = "GPS LOCK" if self.s.source == "WINDOWS" else "LOC FALLBACK"
+        status = {
+            "GPS": "GPS LOCK",
+            "WINDOWS": "WIN LOC",
+            "MACOS": "MAC LOC",
+            "LINUX": "LINUX LOC",
+            "SYSTEM": "SYS LOC",
+            "FALLBACK": "LOC FALLBACK",
+        }.get(self.s.source, self.s.source[:12])
         p.setFont(self.mono(9, True))
         p.drawText(int(self.width()*.205), m+27, status)
 
