@@ -27,7 +27,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3.6 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.3.7 (personal navigation proof-of-concept)"
 
 MAP_RADIUS_M = 4200
 MIN_MAP_RADIUS_M = 2500
@@ -37,7 +37,6 @@ MAP_FETCH_DEBOUNCE_MS = 350
 MAP_CACHE_LIMIT = 8
 POI_MIN_ZOOM = 0.55
 POI_MAX_DRAW = 36
-POI_MODES = ("ALL", "FUEL", "LANDMARKS", "SERVICES", "OFF")
 POI_ICONS = {
     "FUEL": "G",
     "PARKING": "P",
@@ -413,8 +412,14 @@ class NavDisplay(QWidget):
         self.dragging = False
         self.drag_last = QPointF()
         self.map_rect = QRectF()
-        self.poi_mode = "ALL"
-        self.poi_last_mode = "ALL"
+        self.poi_enabled = {
+            "FUEL": True,
+            "PARKING": True,
+            "FOOD": True,
+            "MEDICAL": True,
+            "LODGING": True,
+            "LANDMARK": True,
+        }
 
         # Viewport-aware map cache. A cached circle can satisfy future pans or
         # zooms without another network request when it fully covers the view.
@@ -690,37 +695,64 @@ class NavDisplay(QWidget):
         if h in ("primary", "secondary"): return QPen(DIM, 2)
         return QPen(FAINT, 1)
 
-    def poi_visible_for_mode(self, category):
-        if self.poi_mode == "OFF":
-            return False
-        if self.poi_mode == "ALL":
-            return True
-        if self.poi_mode == "FUEL":
-            return category == "FUEL"
-        if self.poi_mode == "LANDMARKS":
-            return category == "LANDMARK"
-        if self.poi_mode == "SERVICES":
-            return category in ("PARKING", "FOOD", "MEDICAL", "LODGING")
-        return False
+    def poi_is_enabled(self, category):
+        return self.poi_enabled.get(category, False)
 
-    def toggle_pois(self):
-        if self.poi_mode == "OFF":
-            self.poi_mode = self.poi_last_mode or "ALL"
-        else:
-            self.poi_last_mode = self.poi_mode
-            self.poi_mode = "OFF"
-        self.update()
+    def toggle_poi_category(self, category):
+        if category in self.poi_enabled:
+            self.poi_enabled[category] = not self.poi_enabled[category]
+            self.update()
 
-    def cycle_poi_mode(self):
-        modes = list(POI_MODES)
-        idx = modes.index(self.poi_mode) if self.poi_mode in modes else 0
-        self.poi_mode = modes[(idx + 1) % len(modes)]
-        if self.poi_mode != "OFF":
-            self.poi_last_mode = self.poi_mode
-        self.update()
+    def draw_poi_legend(self, p, r):
+        """Compact Pip-Boy-style POI legend with live ON/OFF state."""
+        items = [
+            ("G", "FUEL", "FUEL"),
+            ("P", "PARK", "PARKING"),
+            ("F", "FOOD", "FOOD"),
+            ("M", "MED", "MEDICAL"),
+            ("B", "BED", "LODGING"),
+            ("L", "LAND", "LANDMARK"),
+        ]
+
+        box_w = 182
+        row_h = 20
+        box_h = 22 + row_h * len(items)
+        x = r.right() - box_w - 12
+        y = r.top() + 12
+        box = QRectF(x, y, box_w, box_h)
+
+        p.save()
+        p.fillRect(box, QColor(1, 7, 3, 225))
+        p.setPen(QPen(DIM, 1))
+        p.drawRect(box)
+
+        p.setPen(GREEN)
+        p.setFont(self.mono(8, True))
+        p.drawText(int(x+8), int(y+14), "POI LEGEND")
+
+        yy = y + 32
+        for glyph, label, category in items:
+            enabled = self.poi_enabled.get(category, False)
+
+            icon = QRectF(x+8, yy-11, 16, 16)
+            p.setPen(QPen(BRIGHT if enabled else FAINT, 1))
+            p.drawRect(icon)
+            p.setFont(self.mono(8, True))
+            p.drawText(icon, Qt.AlignCenter, glyph)
+
+            p.setPen(GREEN if enabled else FAINT)
+            p.setFont(self.mono(8, True))
+            p.drawText(int(x+31), int(yy+1), label)
+
+            state = "ON" if enabled else "OFF"
+            p.setPen(BRIGHT if enabled else DIM)
+            p.drawText(int(x+143), int(yy+1), state)
+            yy += row_h
+
+        p.restore()
 
     def draw_poi_markers(self, p, r, markers):
-        if not markers or self.poi_mode == "OFF" or self.zoom < POI_MIN_ZOOM:
+        if not markers or not any(self.poi_enabled.values()) or self.zoom < POI_MIN_ZOOM:
             return
 
         if self.zoom >= 1.50:
@@ -908,9 +940,9 @@ class NavDisplay(QWidget):
             p.drawLine(QPointF(x*ppm-14,y*ppm),QPointF(x*ppm+14,y*ppm))
             p.drawLine(QPointF(x*ppm,y*ppm-14),QPointF(x*ppm,y*ppm+14))
 
-        if self.poi_mode != "OFF" and self.zoom >= POI_MIN_ZOOM:
+        if any(self.poi_enabled.values()) and self.zoom >= POI_MIN_ZOOM:
             for poi in self.s.pois:
-                if not self.poi_visible_for_mode(poi.category):
+                if not self.poi_is_enabled(poi.category):
                     continue
                 x, y = local_xy(poi.lat, poi.lon, self.s.lat, self.s.lon)
                 screen_pos = p.transform().map(QPointF(x*ppm, y*ppm))
@@ -925,6 +957,7 @@ class NavDisplay(QWidget):
                 used.add(name); p.drawText(pos+QPointF(3,-3),name.upper()[:18])
         p.restore()
         self.draw_poi_markers(p, r, poi_markers)
+        self.draw_poi_legend(p, r)
 
         # Truck stays centered in FOLLOW mode; in FREE PAN it moves with the
         # panned world so the user can see where the vehicle is relative to
@@ -941,11 +974,12 @@ class NavDisplay(QWidget):
         mode = "FOLLOW" if self.follow_vehicle else "FREE PAN"
         az = "AUTO" if self.auto_zoom else "MANUAL"
         p.drawText(int(r.left()+14),int(r.bottom()-14),
-                   f"{mode}   ZOOM {self.zoom:0.2f}X {az}   +/- ZOOM   A AUTO   P POI")
+                   f"{mode}   ZOOM {self.zoom:0.2f}X {az}   +/- ZOOM   A AUTO")
         p.setPen(DIM); p.setFont(self.mono(7,True))
         detail_name = ("LOCAL", "REGIONAL", "MAJOR")[min(2, self.loaded_map_detail)]
+        poi_on = sum(1 for value in self.poi_enabled.values() if value)
         p.drawText(int(r.left()+14),int(r.bottom()-29),
-                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}   POI {self.poi_mode}")
+                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}   POI {poi_on}/6")
         if not self.follow_vehicle:
             label = "[ RECENTER ]"
             tw = p.fontMetrics().horizontalAdvance(label)
@@ -1124,11 +1158,18 @@ class NavDisplay(QWidget):
             if self.auto_zoom:
                 self.recenter()
             self.update()
+        elif e.key()==Qt.Key_G:
+            self.toggle_poi_category("FUEL")
         elif e.key()==Qt.Key_P:
-            if e.modifiers() & Qt.ShiftModifier:
-                self.cycle_poi_mode()
-            else:
-                self.toggle_pois()
+            self.toggle_poi_category("PARKING")
+        elif e.key()==Qt.Key_F:
+            self.toggle_poi_category("FOOD")
+        elif e.key()==Qt.Key_M:
+            self.toggle_poi_category("MEDICAL")
+        elif e.key()==Qt.Key_B:
+            self.toggle_poi_category("LODGING")
+        elif e.key()==Qt.Key_L:
+            self.toggle_poi_category("LANDMARK")
         elif e.key()==Qt.Key_Home:
             self.recenter()
         super().keyPressEvent(e)
