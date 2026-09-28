@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.7
+# NAV-COM 2006 — Navigator POC v0.3.8
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -162,10 +162,23 @@ viewport cache.
 A compact on-map **POI LEGEND** shows all six categories and their current
 **ON/OFF** state. All categories start enabled.
 
+The legend is intentionally small. Clicking anywhere on the expanded legend
+collapses it into a tiny `POI n/6 [+]` status strip; clicking that strip
+expands the full legend again. Legend clicks are handled before map dragging,
+so collapsing or expanding it does not pan the map.
+
 When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.8 — Compact collapsible POI legend
+
+- reduced the expanded POI legend footprint
+- tightened icon, font, and row spacing
+- clicking the legend collapses it into a small `POI n/6 [+]` strip
+- clicking the collapsed strip restores the full legend
+- legend clicks no longer fall through to map panning
 
 ### v0.3.7 — Individual POI controls and legend
 
