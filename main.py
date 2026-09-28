@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime
 import json
 import math
+from pathlib import Path
+import sqlite3
 import sys
 import threading
 import time
@@ -27,7 +29,10 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3.8 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.3.9 (personal navigation proof-of-concept)"
+
+BASE_DIR = Path(__file__).resolve().parent
+OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
 
 MAP_RADIUS_M = 4200
 MIN_MAP_RADIUS_M = 2500
@@ -67,12 +72,26 @@ class POI:
 
 
 @dataclass
+class OfflineMapRegion:
+    path: Path
+    name: str
+    coverage: list
+
+    def contains(self, lat, lon):
+        return any(
+            min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
+            for min_lat, max_lat, min_lon, max_lon in self.coverage
+        )
+
+
+@dataclass
 class MapCacheEntry:
     center: tuple
     radius_m: float
     detail: int
     roads: list
     pois: list
+    source: str = "ONLINE"
     last_used: float = field(default_factory=time.time)
 
 
@@ -111,7 +130,7 @@ class NavState:
 
 class Bridge(QObject):
     location = Signal(float, float, float, str)
-    roads = Signal(object, object, float, float, float, int)
+    roads = Signal(object, object, float, float, float, int, str)
     map_error = Signal(str)
     destination = Signal(float, float, str)
     route = Signal(object, object, float, float)
@@ -200,6 +219,114 @@ def classify_poi(tags):
     if tourism in ("attraction", "museum", "viewpoint") or tags.get("historic"):
         return "LANDMARK", tourism or tags.get("historic", "historic")
     return None, ""
+
+
+def discover_offline_maps():
+    regions = []
+    if not OFFLINE_MAP_DIR.exists():
+        return regions
+
+    for path in sorted(OFFLINE_MAP_DIR.glob("*.navmap")):
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as conn:
+                meta = dict(conn.execute("SELECT key, value FROM metadata"))
+                coverage = [
+                    (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+                    for row in conn.execute(
+                        "SELECT min_lat, max_lat, min_lon, max_lon FROM coverage"
+                    )
+                ]
+            if coverage:
+                regions.append(OfflineMapRegion(
+                    path=path,
+                    name=meta.get("name", path.stem),
+                    coverage=coverage
+                ))
+        except Exception:
+            # A bad or half-copied file should never prevent NAV-COM starting.
+            continue
+    return regions
+
+
+def find_offline_map(regions, lat, lon):
+    for region in regions:
+        if region.contains(lat, lon):
+            return region
+    return None
+
+
+def map_bbox(lat, lon, radius_m):
+    dlat = radius_m / 111320.0
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    dlon = radius_m / (111320.0 * cos_lat)
+    return lat-dlat, lat+dlat, lon-dlon, lon+dlon
+
+
+def query_offline_map(region, lat, lon, radius_m, detail):
+    min_lat, max_lat, min_lon, max_lon = map_bbox(lat, lon, radius_m)
+    uri = region.path.resolve().as_uri() + "?mode=ro"
+
+    if detail == 0:
+        road_types = None
+        poi_categories = None
+    elif detail == 1:
+        road_types = (
+            "motorway", "motorway_link", "trunk", "trunk_link",
+            "primary", "primary_link", "secondary", "secondary_link",
+            "tertiary", "tertiary_link", "unclassified"
+        )
+        poi_categories = None
+    else:
+        road_types = (
+            "motorway", "motorway_link", "trunk", "trunk_link",
+            "primary", "primary_link", "secondary", "secondary_link"
+        )
+        poi_categories = ("FUEL", "MEDICAL", "LANDMARK")
+
+    with sqlite3.connect(uri, uri=True) as conn:
+        road_sql = """
+            SELECT r.name, r.highway, r.geometry
+            FROM road_index i
+            JOIN roads r ON r.id = i.id
+            WHERE i.max_lat >= ? AND i.min_lat <= ?
+              AND i.max_lon >= ? AND i.min_lon <= ?
+        """
+        road_params = [min_lat, max_lat, min_lon, max_lon]
+        if road_types:
+            road_sql += " AND r.highway IN (" + ",".join("?" * len(road_types)) + ")"
+            road_params.extend(road_types)
+
+        roads = []
+        for name, highway, geometry in conn.execute(road_sql, road_params):
+            points = [tuple(point) for point in json.loads(geometry)]
+            if len(points) > 1:
+                roads.append(Road(points, name or "", highway or ""))
+
+        poi_sql = """
+            SELECT p.lat, p.lon, p.category, p.name, p.kind
+            FROM poi_index i
+            JOIN pois p ON p.id = i.id
+            WHERE i.max_lat >= ? AND i.min_lat <= ?
+              AND i.max_lon >= ? AND i.min_lon <= ?
+        """
+        poi_params = [min_lat, max_lat, min_lon, max_lon]
+        if poi_categories:
+            poi_sql += " AND p.category IN (" + ",".join("?" * len(poi_categories)) + ")"
+            poi_params.extend(poi_categories)
+
+        pois = [
+            POI(
+                lat=float(plat),
+                lon=float(plon),
+                category=category,
+                name=name or "",
+                kind=kind or ""
+            )
+            for plat, plon, category, name, kind in conn.execute(poi_sql, poi_params)
+        ]
+
+    return roads, pois
 
 
 def fetch_map_data(lat, lon, radius_m=MAP_RADIUS_M, detail=0):
@@ -431,6 +558,8 @@ class NavDisplay(QWidget):
         self.loaded_map_radius_m = 0.0
         self.loaded_map_detail = 0
         self.loaded_map_center = None
+        self.loaded_map_source = "ONLINE"
+        self.offline_maps = discover_offline_maps()
 
         self.map_refresh_timer = QTimer(self)
         self.map_refresh_timer.setSingleShot(True)
@@ -572,6 +701,7 @@ class NavDisplay(QWidget):
         self.loaded_map_center = entry.center
         self.loaded_map_radius_m = entry.radius_m
         self.loaded_map_detail = entry.detail
+        self.loaded_map_source = entry.source
         self.s.loading = ""
         self.update()
 
@@ -606,19 +736,33 @@ class NavDisplay(QWidget):
 
     def _road_worker(self, lat, lon, radius, detail):
         try:
-            roads, pois = fetch_map_data(lat, lon, radius, detail)
-            self.bridge.roads.emit(roads, pois, lat, lon, radius, detail)
+            region = find_offline_map(self.offline_maps, lat, lon)
+            source = "ONLINE"
+            if region is not None:
+                try:
+                    roads, pois = query_offline_map(region, lat, lon, radius, detail)
+                    source = "OFFLINE " + region.name.upper()
+                except Exception:
+                    roads, pois = fetch_map_data(lat, lon, radius, detail)
+                    source = "ONLINE FALLBACK"
+            else:
+                roads, pois = fetch_map_data(lat, lon, radius, detail)
+
+            self.bridge.roads.emit(
+                roads, pois, lat, lon, radius, detail, source
+            )
         except Exception as exc:
             self.bridge.map_error.emit("MAP: " + str(exc))
 
-    def on_roads(self, roads, pois, lat, lon, radius, detail):
+    def on_roads(self, roads, pois, lat, lon, radius, detail, source):
         self.map_request_inflight = False
         entry = MapCacheEntry(
             center=(lat, lon),
             radius_m=radius,
             detail=detail,
             roads=roads,
-            pois=pois
+            pois=pois,
+            source=source
         )
         self.road_cache.append(entry)
         self.road_cache.sort(key=lambda e: e.last_used, reverse=True)
@@ -1004,8 +1148,9 @@ class NavDisplay(QWidget):
         p.setPen(DIM); p.setFont(self.mono(7,True))
         detail_name = ("LOCAL", "REGIONAL", "MAJOR")[min(2, self.loaded_map_detail)]
         poi_on = sum(1 for value in self.poi_enabled.values() if value)
+        source = self.loaded_map_source[:24]
         p.drawText(int(r.left()+14),int(r.bottom()-29),
-                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}   POI {poi_on}/6")
+                   f"{source}   MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}   POI {poi_on}/6")
         if not self.follow_vehicle:
             label = "[ RECENTER ]"
             tw = p.fontMetrics().horizontalAdvance(label)
