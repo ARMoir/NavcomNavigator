@@ -361,3 +361,11 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# NAV-COM offline map data
+downloads/
+*.osm.pbf
+offline_maps/*.navmap
+offline_maps/*.navmap-journal
+offline_maps/*.navmap-wal
+offline_maps/*.navmap-shm
