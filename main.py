@@ -33,7 +33,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.4.4 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.5 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -181,6 +181,7 @@ def parse_nmea_sentence(line):
         if fields[2] != "A":
             return None
         return {
+            "sentence": "RMC",
             "lat": nmea_coord(fields[3], fields[4]),
             "lon": nmea_coord(fields[5], fields[6]),
             "speed_mps": float(fields[7] or 0.0) * 0.514444,
@@ -193,6 +194,7 @@ def parse_nmea_sentence(line):
             return None
         hdop = float(fields[8] or 0.0)
         return {
+            "sentence": "GGA",
             "lat": nmea_coord(fields[2], fields[3]),
             "lon": nmea_coord(fields[4], fields[5]),
             "speed_mps": 0.0,
@@ -223,16 +225,32 @@ def parse_network_gps_endpoint(value):
 
 def merge_nmea_fix(best, fix):
     if best is None:
-        return dict(fix)
+        best = {
+            "lat": fix["lat"],
+            "lon": fix["lon"],
+            "accuracy_m": 0.0,
+            "speed_mps": 0.0,
+            "heading": 0.0,
+            "has_gga": False,
+            "has_rmc": False,
+        }
 
     best["lat"] = fix["lat"]
     best["lon"] = fix["lon"]
-    if fix["accuracy_m"] > 0:
-        best["accuracy_m"] = fix["accuracy_m"]
-    if fix["speed_mps"] > 0:
+
+    if fix.get("sentence") == "GGA":
+        best["has_gga"] = True
+        if fix["accuracy_m"] > 0:
+            best["accuracy_m"] = fix["accuracy_m"]
+
+    if fix.get("sentence") == "RMC":
+        best["has_rmc"] = True
+        # Zero is meaningful here: a stationary receiver should explicitly
+        # clear any previously derived speed/course instead of being treated
+        # as though RMC did not provide those fields.
         best["speed_mps"] = fix["speed_mps"]
-    if fix["heading"] > 0:
         best["heading"] = fix["heading"]
+
     return best
 
 
@@ -265,7 +283,10 @@ def get_network_nmea_location(endpoint, timeout_s=NETWORK_GPS_TIMEOUT_S):
                     fix = parse_nmea_sentence(line.strip())
                     if fix:
                         best = merge_nmea_fix(best, fix)
-                        if best is not None:
+                        # Prefer a complete cycle containing RMC because it
+                        # carries the receiver's actual speed/course. GGA may
+                        # arrive first and is retained for HDOP/accuracy.
+                        if best["has_rmc"]:
                             return (
                                 best["lat"],
                                 best["lon"],
@@ -302,7 +323,10 @@ def get_network_nmea_location(endpoint, timeout_s=NETWORK_GPS_TIMEOUT_S):
                     fix = parse_nmea_sentence(line.strip())
                     if fix:
                         best = merge_nmea_fix(best, fix)
-                        if best is not None:
+                        # Prefer a complete cycle containing RMC because it
+                        # carries the receiver's actual speed/course. GGA may
+                        # arrive first and is retained for HDOP/accuracy.
+                        if best["has_rmc"]:
                             return (
                                 best["lat"],
                                 best["lon"],
@@ -311,6 +335,16 @@ def get_network_nmea_location(endpoint, timeout_s=NETWORK_GPS_TIMEOUT_S):
                                 best["speed_mps"],
                                 f"{protocol}://{host}:{port}",
                             )
+
+    if best is not None:
+        return (
+            best["lat"],
+            best["lon"],
+            best["accuracy_m"],
+            best["heading"],
+            best["speed_mps"],
+            f"{protocol}://{host}:{port}",
+        )
 
     raise RuntimeError(
         f"network GPS {protocol}://{host}:{port} produced no valid NMEA fix"
@@ -392,10 +426,7 @@ def get_nmea_location(preferred_port=None, timeout_s=GPS_SCAN_TIMEOUT_S):
 
                         best = merge_nmea_fix(best, fix)
 
-                        # One valid NMEA fix is enough to establish GPS as the
-                        # preferred source. Additional motion/accuracy values
-                        # will arrive during later polls.
-                        if best is not None:
+                        if best["has_rmc"]:
                             return (
                                 best["lat"],
                                 best["lon"],
@@ -404,6 +435,16 @@ def get_nmea_location(preferred_port=None, timeout_s=GPS_SCAN_TIMEOUT_S):
                                 best["speed_mps"],
                                 port,
                             )
+
+                    if best is not None:
+                        return (
+                            best["lat"],
+                            best["lon"],
+                            best["accuracy_m"],
+                            best["heading"],
+                            best["speed_mps"],
+                            port,
+                        )
             except Exception as exc:
                 last_error = exc
 
@@ -1061,8 +1102,11 @@ class NavDisplay(QWidget):
 
         api_heading = getattr(self, "_pending_heading", 0.0)
         api_speed = getattr(self, "_pending_speed", 0.0)
+        nmea_motion = source in ("NETGPS", "GPS")
 
-        if math.isfinite(api_heading) and 0.0 < api_heading <= 360.0:
+        if nmea_motion and math.isfinite(api_heading):
+            self.s.heading_deg = api_heading % 360.0
+        elif math.isfinite(api_heading) and 0.0 < api_heading <= 360.0:
             self.s.heading_deg = api_heading
         elif old and haversine_m(old, new) > 5:
             derived = bearing_deg(old, new)
@@ -1071,7 +1115,9 @@ class NavDisplay(QWidget):
         elif not math.isfinite(self.s.heading_deg):
             self.s.heading_deg = 0.0
 
-        if math.isfinite(api_speed) and api_speed > 0.0:
+        if nmea_motion and math.isfinite(api_speed):
+            self.s.speed_mps = max(0.0, api_speed)
+        elif math.isfinite(api_speed) and api_speed > 0.0:
             self.s.speed_mps = api_speed
         elif old and self.s.last_position_time:
             dt = max(0.1, now-self.s.last_position_time)
