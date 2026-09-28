@@ -811,11 +811,18 @@ class NavDisplay(QWidget):
         p.drawText(int(x+18),int(y+432),
                    f"ACC  {self.s.accuracy_m:0.0f} M")
 
+        # Live GPS coordinates directly beneath the accuracy readout.
+        p.setPen(DIM)
+        p.setFont(self.mono(10, True))
+        p.drawText(int(x+18),int(y+456),f"LAT  {self.s.lat:+.6f}")
+        p.drawText(int(x+18),int(y+476),f"LON  {self.s.lon:+.6f}")
+
         if self.s.destination_name:
-            p.setFont(self.mono(9))
+            p.setPen(GREEN)
+            p.setFont(self.mono(8))
             name=self.s.destination_name.upper()
-            p.drawText(int(x+18),int(y+468),name[:38])
-            p.drawText(int(x+18),int(y+486),name[38:76])
+            p.drawText(int(x+18),int(y+510),name[:42])
+            p.drawText(int(x+18),int(y+526),name[42:84])
 
         if self.s.error:
             p.setPen(DIM); p.setFont(self.mono(9))
