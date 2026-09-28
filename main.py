@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import sys
 import threading
@@ -31,7 +32,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.4.1 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.4.2 (personal navigation proof-of-concept)"
 
 BASE_DIR = Path(__file__).resolve().parent
 OFFLINE_MAP_DIR = BASE_DIR / "offline_maps"
@@ -56,6 +57,7 @@ POI_ICONS = {
 LOCATION_POLL_MS = 4000
 GPS_SCAN_TIMEOUT_S = 2.0
 GPS_DEFAULT_BAUDS = (9600, 4800)
+NETWORK_GPS_TIMEOUT_S = 2.0
 SYSTEM_LOCATION_TIMEOUT_MS = 3500
 OFF_ROUTE_METERS = 80
 REROUTE_COOLDOWN_S = 15
@@ -200,6 +202,120 @@ def parse_nmea_sentence(line):
     return None
 
 
+def parse_network_gps_endpoint(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+
+    if "://" not in value:
+        value = "tcp://" + value
+
+    parsed = urllib.parse.urlparse(value)
+    protocol = parsed.scheme.lower()
+    if protocol not in ("tcp", "udp"):
+        raise ValueError("network GPS protocol must be tcp or udp")
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("network GPS must be host:port")
+
+    return protocol, parsed.hostname, int(parsed.port)
+
+
+def merge_nmea_fix(best, fix):
+    if best is None:
+        return dict(fix)
+
+    best["lat"] = fix["lat"]
+    best["lon"] = fix["lon"]
+    if fix["accuracy_m"] > 0:
+        best["accuracy_m"] = fix["accuracy_m"]
+    if fix["speed_mps"] > 0:
+        best["speed_mps"] = fix["speed_mps"]
+    if fix["heading"] > 0:
+        best["heading"] = fix["heading"]
+    return best
+
+
+def get_network_nmea_location(endpoint, timeout_s=NETWORK_GPS_TIMEOUT_S):
+    parsed = parse_network_gps_endpoint(endpoint)
+    if parsed is None:
+        raise RuntimeError("network GPS not configured")
+
+    protocol, host, port = parsed
+    deadline = time.monotonic() + timeout_s
+    best = None
+    buffer = ""
+
+    if protocol == "tcp":
+        with socket.create_connection((host, port), timeout=timeout_s) as sock:
+            sock.settimeout(0.35)
+            while time.monotonic() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+
+                buffer += chunk.decode("ascii", errors="ignore")
+                lines = buffer.replace("\r", "\n").split("\n")
+                buffer = lines.pop()
+
+                for line in lines:
+                    fix = parse_nmea_sentence(line.strip())
+                    if fix:
+                        best = merge_nmea_fix(best, fix)
+                        if best is not None:
+                            return (
+                                best["lat"],
+                                best["lon"],
+                                best["accuracy_m"],
+                                best["heading"],
+                                best["speed_mps"],
+                                f"{protocol}://{host}:{port}",
+                            )
+
+    else:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(0.35)
+
+            # Most NMEA-over-UDP senders transmit to the configured port.
+            # Bind locally when possible; if the endpoint is a remote unicast
+            # target, connect() still gives us a clean receive path.
+            try:
+                sock.bind(("", port))
+            except OSError:
+                sock.connect((host, port))
+
+            while time.monotonic() < deadline:
+                try:
+                    chunk, _addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    continue
+
+                buffer += chunk.decode("ascii", errors="ignore")
+                lines = buffer.replace("\r", "\n").split("\n")
+                buffer = lines.pop()
+
+                for line in lines:
+                    fix = parse_nmea_sentence(line.strip())
+                    if fix:
+                        best = merge_nmea_fix(best, fix)
+                        if best is not None:
+                            return (
+                                best["lat"],
+                                best["lon"],
+                                best["accuracy_m"],
+                                best["heading"],
+                                best["speed_mps"],
+                                f"{protocol}://{host}:{port}",
+                            )
+
+    raise RuntimeError(
+        f"network GPS {protocol}://{host}:{port} produced no valid NMEA fix"
+    )
+
+
 def gps_candidate_ports(preferred_port=None):
     import serial.tools.list_ports
 
@@ -273,17 +389,7 @@ def get_nmea_location(preferred_port=None, timeout_s=GPS_SCAN_TIMEOUT_S):
                         if not fix:
                             continue
 
-                        if best is None:
-                            best = fix
-                        else:
-                            best["lat"] = fix["lat"]
-                            best["lon"] = fix["lon"]
-                            if fix["accuracy_m"] > 0:
-                                best["accuracy_m"] = fix["accuracy_m"]
-                            if fix["speed_mps"] > 0:
-                                best["speed_mps"] = fix["speed_mps"]
-                            if fix["heading"] > 0:
-                                best["heading"] = fix["heading"]
+                        best = merge_nmea_fix(best, fix)
 
                         # One valid NMEA fix is enough to establish GPS as the
                         # preferred source. Additional motion/accuracy values
@@ -725,6 +831,9 @@ class NavDisplay(QWidget):
         self.loaded_map_source = "ONLINE"
         self.offline_maps = discover_offline_maps()
         self._gps_port = os.environ.get("NAVCOM_GPS_PORT", "").strip() or None
+        self._network_gps = os.environ.get(
+            "NAVCOM_GPS_NETWORK", ""
+        ).strip() or None
         self._gps_error = ""
         self._system_location_pending = False
 
@@ -761,6 +870,20 @@ class NavDisplay(QWidget):
         threading.Thread(target=self._location_worker, daemon=True).start()
 
     def _location_worker(self):
+        errors = []
+
+        if self._network_gps:
+            try:
+                lat, lon, acc, heading, speed, endpoint = (
+                    get_network_nmea_location(self._network_gps)
+                )
+                self._pending_heading = heading
+                self._pending_speed = speed
+                self.bridge.location.emit(lat, lon, acc, "NETGPS")
+                return
+            except Exception as exc:
+                errors.append("NETWORK GPS: " + str(exc))
+
         try:
             lat, lon, acc, heading, speed, port = get_nmea_location(
                 self._gps_port
@@ -771,7 +894,9 @@ class NavDisplay(QWidget):
             self.bridge.location.emit(lat, lon, acc, "GPS")
             return
         except Exception as exc:
-            self.bridge.system_location_request.emit(str(exc))
+            errors.append("SERIAL GPS: " + str(exc))
+
+        self.bridge.system_location_request.emit("; ".join(errors))
 
     def request_system_location(self, gps_error=""):
         self._gps_error = gps_error
@@ -1373,6 +1498,7 @@ class NavDisplay(QWidget):
         p.drawText(m+7, m+29, "NAV-COM 2006")
 
         status = {
+            "NETGPS": "NET GPS",
             "GPS": "GPS LOCK",
             "WINDOWS": "WIN LOC",
             "MACOS": "MAC LOC",
