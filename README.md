@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.5
+# NAV-COM 2006 — Navigator POC v0.3.6
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -25,6 +25,8 @@ are drawn directly by the application.
 - viewport-aware map loading with prefetch
 - in-memory road-area cache
 - adaptive road detail at wide zoom levels
+- optional Pip-Boy-style boxed POI/landmark layer
+- POI filters for fuel, landmarks, and services
 - FOLLOW and FREE PAN modes
 - manual recentering
 - automatic speed/maneuver-based zoom
@@ -59,6 +61,8 @@ Enter an address or place in the destination box and press **Enter**.
 | Double-click map | Recenter on vehicle |
 | `+` / `-` | Zoom in/out |
 | `A` | Toggle AUTO ZOOM; enabling it recenters |
+| `P` | Toggle POI markers on/off |
+| `Shift+P` | Cycle POI filter: ALL → FUEL → LANDMARKS → SERVICES → OFF |
 | `Home` | Recenter |
 | `R` | Recenter while panned; reroute while following |
 | `F11` | Toggle fullscreen |
@@ -75,7 +79,7 @@ The current zoom range is **0.30x to 5.0x**.
 This proof of concept intentionally uses public/community services only for
 light personal testing:
 
-- **OpenStreetMap / Overpass** for nearby road geometry
+- **OpenStreetMap / Overpass** for nearby road geometry and selected POIs
 - **Nominatim** for explicit, user-triggered destination searches
 - **OSRM public demo server** for driving routes and maneuver steps
 
@@ -124,10 +128,45 @@ The current fetch radius is capped at 24 km because this POC still uses the
 public Overpass service. An offline map backend will remove that practical
 limit.
 
+### POI layer
+
+The optional POI layer is loaded with the same viewport request and stored in
+the same map cache as the road geometry, so enabling POIs does not create a
+second stream of map requests.
+
+Markers use intentionally simple Pip-Boy-style boxed glyphs:
+
+| Glyph | Category |
+| --- | --- |
+| `G` | Gas / fuel |
+| `P` | Parking |
+| `F` | Food |
+| `M` | Medical / pharmacy |
+| `B` | Lodging |
+| `L` | Landmark / attraction / historic place |
+
+Marker density is zoom-aware. At wide zoom levels fewer markers are shown, and
+at very wide views the POI query is restricted to higher-value categories.
+Names appear beside markers only at closer zoom levels to keep the map legible.
+
+`P` toggles the layer without reloading the map. `Shift+P` cycles between
+ALL, FUEL, LANDMARKS, SERVICES, and OFF.
+
 When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.6 — Pip-Boy POI layer
+
+- added boxed retro map markers for fuel, parking, food, medical, lodging, and landmarks
+- POIs are fetched in the same Overpass request as road geometry
+- POIs share the existing viewport-aware map cache
+- added zoom-aware marker density and close-range POI labels
+- added `P` to toggle POIs on/off
+- added `Shift+P` to cycle ALL, FUEL, LANDMARKS, SERVICES, and OFF filters
+- wide-area map requests automatically reduce POI categories to limit clutter and service load
+- added live POI mode status to the map footer
 
 ### v0.3.5 — GPS coordinate readout
 
