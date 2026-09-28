@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.3
+# NAV-COM 2006 — Navigator POC v0.3.4
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -21,6 +21,9 @@ are drawn directly by the application.
 - live phosphor digital clock and date
 - scrolling compass tape with N / E / S / W, degree ticks, and fixed lubber line
 - interactive zoom and map panning
+- viewport-aware map loading with prefetch
+- in-memory road-area cache
+- adaptive road detail at wide zoom levels
 - FOLLOW and FREE PAN modes
 - manual recentering
 - automatic speed/maneuver-based zoom
@@ -94,15 +97,50 @@ adapter can replace Windows Location Services without redesigning the UI.
 
 ## Current map behavior
 
-The application downloads a finite radius of OSM road geometry around the
-vehicle. Extreme panning can therefore move beyond the currently loaded road
-network. Recenter to return to the vehicle; road geometry is refreshed as the
-vehicle travels.
+Map data now follows the **visible viewport**, not only the vehicle position.
+
+When you pan or zoom, NAV-COM calculates the geographic area currently visible,
+checks whether an in-memory map cache already covers it, and loads additional
+OpenStreetMap road geometry only when necessary. Requests include extra
+prefetch coverage beyond the screen edges, so small pans do not immediately
+trigger another network request.
+
+The cache currently keeps the eight most recently used map areas in memory.
+Returning to a recently viewed area can therefore reuse its road geometry
+without downloading it again.
+
+At wider zoom levels the map intentionally reduces road detail:
+
+- **LOCAL** — full drivable-road detail
+- **REGIONAL** — primary through tertiary/unclassified roads
+- **MAJOR** — major road network only
+
+This keeps large-area Overpass requests reasonable while preserving useful
+navigation context. The bottom-left map status reports the loaded radius,
+detail tier, and cache occupancy.
+
+The current fetch radius is capped at 24 km because this POC still uses the
+public Overpass service. An offline map backend will remove that practical
+limit.
 
 When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.4 — Viewport-aware map loading
+
+- map coverage now follows the visible viewport instead of only the vehicle
+- panning into a new area automatically requests additional road geometry
+- zooming out requests enough geography to cover the wider view
+- added a prefetch margin beyond the visible screen edges
+- added an eight-area in-memory road cache
+- revisiting cached areas avoids unnecessary network requests
+- map loading is debounced while dragging to reduce repeated requests
+- wide zoom levels automatically use REGIONAL or MAJOR road detail
+- added live map radius/detail/cache diagnostics to the map footer
+- existing roads remain visible while additional map data loads
+- map requests are capped at 24 km while using the public Overpass endpoint
 
 ### v0.3.3 — Interactive moving map
 
