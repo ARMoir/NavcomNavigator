@@ -1,4 +1,4 @@
-# NAV-COM 2006 — Navigator POC v0.3.8
+# NAV-COM 2006 — Navigator POC v0.3.9
 
 NAV-COM 2006 is a retro-styled Python navigation proof of concept inspired by
 1980s monochrome vector/CRT displays. It uses a custom PySide6 renderer rather
@@ -9,6 +9,7 @@ are drawn directly by the application.
 
 - Windows laptop geolocation
 - real nearby OpenStreetMap road geometry
+- automatic offline `.navmap` road/POI loading with online fallback
 - destination entry and explicit search on Enter
 - OSRM driving route calculation
 - full route geometry with bright-green active route
@@ -90,10 +91,10 @@ light personal testing:
 
 There is no autocomplete. Destination lookup only occurs when Enter is pressed.
 
-These public endpoints should not be treated as the production backend for an
-always-on vehicle navigator. A truck-ready build should use an appropriate
-hosted provider or, preferably for this project, local/offline OSM data and a
-local routing engine.
+NAV-COM can now use local `.navmap` files for road geometry and POIs, with
+Overpass retained as an automatic fallback outside installed offline coverage.
+Destination search and driving routes still use the public Nominatim and OSRM
+services in this version.
 
 ## GPS reality
 
@@ -129,9 +130,58 @@ This keeps large-area Overpass requests reasonable while preserving useful
 navigation context. The bottom-left map status reports the loaded radius,
 detail tier, and cache occupancy.
 
-The current fetch radius is capped at 24 km because this POC still uses the
-public Overpass service. An offline map backend will remove that practical
-limit.
+Online Overpass requests remain capped at a 24 km radius. When a matching
+offline `.navmap` is installed, road and POI queries are read directly from
+SQLite instead.
+
+### Offline maps
+
+NAV-COM scans `offline_maps/*.navmap` when it starts. If the current map
+center falls inside an installed region, road geometry and POIs are read from
+that SQLite database automatically. If no installed map covers the area,
+NAV-COM falls back to the existing online Overpass loader.
+
+The footer identifies the active source, for example:
+
+```text
+OFFLINE NEW ENGLAND
+```
+
+or:
+
+```text
+ONLINE
+```
+
+The normal NAV-COM installation does not need any extra packages to **use**
+offline maps. The optional builder uses `osmium` only on the computer where
+you create the database.
+
+For New England, the simplest setup from the repository root is:
+
+```powershell
+python -m pip install -r tools/requirements.txt
+python tools/download_new_england.py --build
+```
+
+That downloads the Connecticut, Maine, Massachusetts, New Hampshire, Rhode
+Island, and Vermont OSM extracts and produces:
+
+```text
+offline_maps/new-england.navmap
+```
+
+For another location, download one or more `.osm.pbf` files and run:
+
+```powershell
+python tools/build_navmap.py --name "Florida" --output offline_maps/florida.navmap downloads/florida-latest.osm.pbf
+```
+
+The builder accepts either individual PBF files or a directory containing
+several PBF files. Generated PBF and `.navmap` files are ignored by Git.
+
+Offline routing is deliberately separate for now: the map and POIs can be
+fully local while route calculation continues to use OSRM online.
 
 ### POI layer
 
@@ -171,6 +221,18 @@ When heading data is unavailable while stationary, the display safely remains
 north-up until a usable heading can be obtained or derived from movement.
 
 ## Version history
+
+### v0.3.9 — Simple offline map database support
+
+- NAV-COM now scans `offline_maps/*.navmap` automatically at startup
+- installed SQLite maps provide roads and POIs without Overpass
+- online Overpass remains the automatic fallback outside installed coverage
+- map cache entries retain and display whether their source is ONLINE or OFFLINE
+- added `tools/build_navmap.py` to build one navmap from one or many OSM PBF files
+- added `tools/download_new_england.py --build` for the simple New England setup
+- added a separate tools dependency file so normal NAV-COM runtime installs stay unchanged
+- generated PBF and navmap data are excluded from Git
+- routing remains online in this version
 
 ### v0.3.8 — Compact collapsible POI legend
 
@@ -264,7 +326,6 @@ v0.3.1:
 ## Next logical upgrades
 
 - USB GPS / NMEA receiver support
-- local/offline map extract
 - local Valhalla or OSRM routing
 - offline address search
 - route-progress-aware maneuver selection
