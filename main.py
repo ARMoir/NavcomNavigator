@@ -27,7 +27,7 @@ FALLBACK_LON = -71.8648
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
-USER_AGENT = "NAV-COM-2006/0.3.4 (personal navigation proof-of-concept)"
+USER_AGENT = "NAV-COM-2006/0.3.6 (personal navigation proof-of-concept)"
 
 MAP_RADIUS_M = 4200
 MIN_MAP_RADIUS_M = 2500
@@ -35,6 +35,17 @@ MAX_MAP_RADIUS_M = 24000
 MAP_PREFETCH_MARGIN = 1.25
 MAP_FETCH_DEBOUNCE_MS = 350
 MAP_CACHE_LIMIT = 8
+POI_MIN_ZOOM = 0.55
+POI_MAX_DRAW = 36
+POI_MODES = ("ALL", "FUEL", "LANDMARKS", "SERVICES", "OFF")
+POI_ICONS = {
+    "FUEL": "G",
+    "PARKING": "P",
+    "FOOD": "F",
+    "MEDICAL": "M",
+    "LODGING": "B",
+    "LANDMARK": "L",
+}
 LOCATION_POLL_MS = 4000
 OFF_ROUTE_METERS = 80
 REROUTE_COOLDOWN_S = 15
@@ -48,11 +59,21 @@ class Road:
 
 
 @dataclass
+class POI:
+    lat: float
+    lon: float
+    category: str
+    name: str = ""
+    kind: str = ""
+
+
+@dataclass
 class MapCacheEntry:
     center: tuple
     radius_m: float
     detail: int
     roads: list
+    pois: list
     last_used: float = field(default_factory=time.time)
 
 
@@ -74,6 +95,7 @@ class NavState:
     heading_deg: float = 0.0
     speed_mps: float = 0.0
     roads: list = field(default_factory=list)
+    pois: list = field(default_factory=list)
     destination: tuple | None = None
     destination_name: str = ""
     route: list = field(default_factory=list)
@@ -90,7 +112,7 @@ class NavState:
 
 class Bridge(QObject):
     location = Signal(float, float, float, str)
-    roads = Signal(object, float, float, float, int)
+    roads = Signal(object, object, float, float, float, int)
     map_error = Signal(str)
     destination = Signal(float, float, str)
     route = Signal(object, object, float, float)
@@ -145,47 +167,123 @@ def map_detail_for_radius(radius_m):
     return 2
 
 
-def fetch_roads(lat, lon, radius_m=MAP_RADIUS_M, detail=0):
-    # Large zoomed-out views intentionally request less road detail. This
-    # keeps public Overpass use reasonable while preserving useful context.
+def poi_patterns_for_detail(detail):
     if detail == 0:
-        selector = (
+        return (
+            "fuel|parking|restaurant|cafe|fast_food|hospital|clinic|pharmacy",
+            "attraction|museum|viewpoint|hotel|motel"
+        )
+    if detail == 1:
+        return (
+            "fuel|parking|restaurant|fast_food|hospital|clinic|pharmacy",
+            "attraction|museum|viewpoint|hotel|motel"
+        )
+    return (
+        "fuel|hospital|clinic|pharmacy",
+        "attraction|museum|viewpoint"
+    )
+
+
+def classify_poi(tags):
+    amenity = tags.get("amenity", "")
+    tourism = tags.get("tourism", "")
+
+    if amenity == "fuel":
+        return "FUEL", amenity
+    if amenity == "parking":
+        return "PARKING", amenity
+    if amenity in ("restaurant", "cafe", "fast_food"):
+        return "FOOD", amenity
+    if amenity in ("hospital", "clinic", "pharmacy"):
+        return "MEDICAL", amenity
+    if tourism in ("hotel", "motel"):
+        return "LODGING", tourism
+    if tourism in ("attraction", "museum", "viewpoint") or tags.get("historic"):
+        return "LANDMARK", tourism or tags.get("historic", "historic")
+    return None, ""
+
+
+def fetch_map_data(lat, lon, radius_m=MAP_RADIUS_M, detail=0):
+    # Roads and selected POIs share one Overpass request so the optional POI
+    # layer does not double map-service traffic.
+    if detail == 0:
+        road_selector = (
             '["highway"]'
             '["highway"!~"footway|path|steps|cycleway|bridleway|corridor|'
             'construction|proposed"]'
         )
     elif detail == 1:
-        selector = (
+        road_selector = (
             '["highway"~"motorway|motorway_link|trunk|trunk_link|primary|'
             'primary_link|secondary|secondary_link|tertiary|tertiary_link|'
             'unclassified"]'
         )
     else:
-        selector = (
+        road_selector = (
             '["highway"~"motorway|motorway_link|trunk|trunk_link|primary|'
             'primary_link|secondary|secondary_link"]'
         )
 
+    amenity_pattern, tourism_pattern = poi_patterns_for_detail(detail)
+    radius = int(radius_m)
     query = f"""
     [out:json][timeout:25];
+    way(around:{radius},{lat},{lon}){road_selector}->.roads;
     (
-      way(around:{int(radius_m)},{lat},{lon}){selector};
-    );
-    out tags geom;
+      nwr(around:{radius},{lat},{lon})["amenity"~"{amenity_pattern}"];
+      nwr(around:{radius},{lat},{lon})["tourism"~"{tourism_pattern}"];
+      nwr(around:{radius},{lat},{lon})["historic"];
+    )->.pois;
+    .roads out tags geom;
+    .pois out tags center;
     """
+
     data = urllib.parse.urlencode({"data": query}).encode()
     obj = request_json(OVERPASS_URL, data=data, timeout=35)
+
     roads = []
+    pois = []
+    seen_pois = set()
+
     for e in obj.get("elements", []):
+        tags = e.get("tags", {})
         geom = e.get("geometry", [])
-        if len(geom) > 1:
-            tags = e.get("tags", {})
+
+        if tags.get("highway") and len(geom) > 1:
             roads.append(Road(
                 [(p["lat"], p["lon"]) for p in geom],
                 tags.get("name", ""),
                 tags.get("highway", "")
             ))
-    return roads
+            continue
+
+        category, kind = classify_poi(tags)
+        if not category:
+            continue
+
+        if "lat" in e and "lon" in e:
+            plat, plon = float(e["lat"]), float(e["lon"])
+        else:
+            center = e.get("center") or {}
+            if "lat" not in center or "lon" not in center:
+                continue
+            plat, plon = float(center["lat"]), float(center["lon"])
+
+        # De-duplicate features that can appear through more than one selector.
+        key = (e.get("type"), e.get("id"), category)
+        if key in seen_pois:
+            continue
+        seen_pois.add(key)
+
+        pois.append(POI(
+            lat=plat,
+            lon=plon,
+            category=category,
+            name=tags.get("name", ""),
+            kind=kind
+        ))
+
+    return roads, pois
 
 
 def geocode(query):
@@ -315,6 +413,8 @@ class NavDisplay(QWidget):
         self.dragging = False
         self.drag_last = QPointF()
         self.map_rect = QRectF()
+        self.poi_mode = "ALL"
+        self.poi_last_mode = "ALL"
 
         # Viewport-aware map cache. A cached circle can satisfy future pans or
         # zooms without another network request when it fully covers the view.
@@ -460,6 +560,7 @@ class NavDisplay(QWidget):
     def _activate_map_entry(self, entry):
         entry.last_used = time.time()
         self.s.roads = entry.roads
+        self.s.pois = entry.pois
         self.s.last_map_center = entry.center
         self.loaded_map_center = entry.center
         self.loaded_map_radius_m = entry.radius_m
@@ -484,7 +585,7 @@ class NavDisplay(QWidget):
 
         self.map_request_inflight = True
         self.map_refresh_pending = False
-        self.s.loading = "LOADING ROADS"
+        self.s.loading = "LOADING MAP"
 
         # Fetch beyond the visible edge. The extra coverage is what lets the
         # user pan a meaningful distance before another request is needed.
@@ -498,18 +599,19 @@ class NavDisplay(QWidget):
 
     def _road_worker(self, lat, lon, radius, detail):
         try:
-            roads = fetch_roads(lat, lon, radius, detail)
-            self.bridge.roads.emit(roads, lat, lon, radius, detail)
+            roads, pois = fetch_map_data(lat, lon, radius, detail)
+            self.bridge.roads.emit(roads, pois, lat, lon, radius, detail)
         except Exception as exc:
             self.bridge.map_error.emit("MAP: " + str(exc))
 
-    def on_roads(self, roads, lat, lon, radius, detail):
+    def on_roads(self, roads, pois, lat, lon, radius, detail):
         self.map_request_inflight = False
         entry = MapCacheEntry(
             center=(lat, lon),
             radius_m=radius,
             detail=detail,
-            roads=roads
+            roads=roads,
+            pois=pois
         )
         self.road_cache.append(entry)
         self.road_cache.sort(key=lambda e: e.last_used, reverse=True)
@@ -587,6 +689,100 @@ class NavDisplay(QWidget):
         if h in ("motorway", "trunk"): return QPen(GREEN, 3)
         if h in ("primary", "secondary"): return QPen(DIM, 2)
         return QPen(FAINT, 1)
+
+    def poi_visible_for_mode(self, category):
+        if self.poi_mode == "OFF":
+            return False
+        if self.poi_mode == "ALL":
+            return True
+        if self.poi_mode == "FUEL":
+            return category == "FUEL"
+        if self.poi_mode == "LANDMARKS":
+            return category == "LANDMARK"
+        if self.poi_mode == "SERVICES":
+            return category in ("PARKING", "FOOD", "MEDICAL", "LODGING")
+        return False
+
+    def toggle_pois(self):
+        if self.poi_mode == "OFF":
+            self.poi_mode = self.poi_last_mode or "ALL"
+        else:
+            self.poi_last_mode = self.poi_mode
+            self.poi_mode = "OFF"
+        self.update()
+
+    def cycle_poi_mode(self):
+        modes = list(POI_MODES)
+        idx = modes.index(self.poi_mode) if self.poi_mode in modes else 0
+        self.poi_mode = modes[(idx + 1) % len(modes)]
+        if self.poi_mode != "OFF":
+            self.poi_last_mode = self.poi_mode
+        self.update()
+
+    def draw_poi_markers(self, p, r, markers):
+        if not markers or self.poi_mode == "OFF" or self.zoom < POI_MIN_ZOOM:
+            return
+
+        if self.zoom >= 1.50:
+            limit = POI_MAX_DRAW
+        elif self.zoom >= 1.00:
+            limit = 28
+        elif self.zoom >= 0.75:
+            limit = 18
+        else:
+            limit = 10
+
+        priority = {
+            "FUEL": 0,
+            "MEDICAL": 1,
+            "LANDMARK": 2,
+            "PARKING": 3,
+            "FOOD": 4,
+            "LODGING": 5,
+        }
+        center = r.center()
+        markers = sorted(
+            markers,
+            key=lambda item: (
+                priority.get(item[1].category, 9),
+                abs(item[0].x() - center.x()) + abs(item[0].y() - center.y())
+            )
+        )
+
+        p.save()
+        p.setClipRect(r.adjusted(2, 2, -2, -34))
+        occupied = set()
+        drawn = 0
+        labels = 0
+
+        for pos, poi in markers:
+            cell = (int(pos.x() // 34), int(pos.y() // 28))
+            if cell in occupied:
+                continue
+            occupied.add(cell)
+
+            box = QRectF(pos.x()-9, pos.y()-9, 18, 18)
+            strong = poi.category in ("FUEL", "MEDICAL", "LANDMARK")
+            p.fillRect(box, BLACK)
+            p.setPen(QPen(BRIGHT if strong else GREEN, 1.5))
+            p.drawRect(box)
+            p.setFont(self.mono(9, True))
+            p.drawText(box, Qt.AlignCenter, POI_ICONS.get(poi.category, "?"))
+
+            if self.zoom >= 1.15 and poi.name and labels < 12:
+                p.setFont(self.mono(7, True))
+                p.setPen(DIM)
+                p.drawText(
+                    QPointF(pos.x()+13, pos.y()+4),
+                    poi.name.upper()[:18]
+                )
+                labels += 1
+
+            drawn += 1
+            if drawn >= limit:
+                break
+
+        p.restore()
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -685,6 +881,7 @@ class NavDisplay(QWidget):
         ppm = (min(r.width(), r.height()) / 7000.0) * self.zoom
 
         labels = []
+        poi_markers = []
         for road in self.s.roads:
             pts = []
             for lat, lon in road.points:
@@ -711,6 +908,15 @@ class NavDisplay(QWidget):
             p.drawLine(QPointF(x*ppm-14,y*ppm),QPointF(x*ppm+14,y*ppm))
             p.drawLine(QPointF(x*ppm,y*ppm-14),QPointF(x*ppm,y*ppm+14))
 
+        if self.poi_mode != "OFF" and self.zoom >= POI_MIN_ZOOM:
+            for poi in self.s.pois:
+                if not self.poi_visible_for_mode(poi.category):
+                    continue
+                x, y = local_xy(poi.lat, poi.lon, self.s.lat, self.s.lon)
+                screen_pos = p.transform().map(QPointF(x*ppm, y*ppm))
+                if r.adjusted(8, 8, -8, -38).contains(screen_pos):
+                    poi_markers.append((screen_pos, poi))
+
         # Rotate road labels with map; deliberately feels like old hardware.
         p.setFont(self.mono(8, True)); p.setPen(DIM)
         used=set()
@@ -718,6 +924,7 @@ class NavDisplay(QWidget):
             if name not in used:
                 used.add(name); p.drawText(pos+QPointF(3,-3),name.upper()[:18])
         p.restore()
+        self.draw_poi_markers(p, r, poi_markers)
 
         # Truck stays centered in FOLLOW mode; in FREE PAN it moves with the
         # panned world so the user can see where the vehicle is relative to
@@ -734,11 +941,11 @@ class NavDisplay(QWidget):
         mode = "FOLLOW" if self.follow_vehicle else "FREE PAN"
         az = "AUTO" if self.auto_zoom else "MANUAL"
         p.drawText(int(r.left()+14),int(r.bottom()-14),
-                   f"{mode}   ZOOM {self.zoom:0.2f}X {az}   +/- ZOOM   A AUTO")
+                   f"{mode}   ZOOM {self.zoom:0.2f}X {az}   +/- ZOOM   A AUTO   P POI")
         p.setPen(DIM); p.setFont(self.mono(7,True))
         detail_name = ("LOCAL", "REGIONAL", "MAJOR")[min(2, self.loaded_map_detail)]
         p.drawText(int(r.left()+14),int(r.bottom()-29),
-                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}")
+                   f"MAP {self.loaded_map_radius_m/1000:0.1f}KM {detail_name}   CACHE {len(self.road_cache)}/{MAP_CACHE_LIMIT}   POI {self.poi_mode}")
         if not self.follow_vehicle:
             label = "[ RECENTER ]"
             tw = p.fontMetrics().horizontalAdvance(label)
@@ -748,7 +955,7 @@ class NavDisplay(QWidget):
         if self.s.loading and not self.s.roads:
             p.setFont(self.mono(17,True))
             p.drawText(r,Qt.AlignCenter,self.s.loading+"...")
-        elif self.s.loading == "LOADING ROADS":
+        elif self.s.loading == "LOADING MAP":
             p.setPen(BRIGHT); p.setFont(self.mono(8,True))
             p.drawText(int(r.right()-105), int(r.top()+18), "[ MAP LOAD ]")
         elif not self.s.roads:
@@ -917,6 +1124,11 @@ class NavDisplay(QWidget):
             if self.auto_zoom:
                 self.recenter()
             self.update()
+        elif e.key()==Qt.Key_P:
+            if e.modifiers() & Qt.ShiftModifier:
+                self.cycle_poi_mode()
+            else:
+                self.toggle_pois()
         elif e.key()==Qt.Key_Home:
             self.recenter()
         super().keyPressEvent(e)
