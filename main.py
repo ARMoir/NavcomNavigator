@@ -779,9 +779,11 @@ class NavDisplay(QWidget):
         if self.system_position_source is not None:
             if not self._system_location_pending:
                 self._system_location_pending = True
-                self.system_position_source.requestUpdate(
-                    SYSTEM_LOCATION_TIMEOUT_MS
+                timeout_ms = max(
+                    SYSTEM_LOCATION_TIMEOUT_MS,
+                    int(self.system_position_source.minimumUpdateInterval())
                 )
+                self.system_position_source.requestUpdate(timeout_ms)
             return
 
         if sys.platform.startswith("win"):
@@ -897,6 +899,8 @@ class NavDisplay(QWidget):
         new = (lat, lon)
         self.s.lat, self.s.lon = lat, lon
         self.s.accuracy_m, self.s.source = accuracy, source
+        if self.s.error.startswith("LOCATION:"):
+            self.s.error = ""
 
         api_heading = getattr(self, "_pending_heading", 0.0)
         api_speed = getattr(self, "_pending_speed", 0.0)
